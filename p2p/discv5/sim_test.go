@@ -50,7 +50,7 @@ func TestSimRandomResolve(t *testing.T) {
 			if err := net.SetFallbackNodes([]*Node{bootnode.Self()}); err != nil {
 				panic(err)
 			}
-			fmt.Printf("launched @ %v: %x\n", time.Now(), net.Self().ID[:16])
+			t.Logf("launched @ %v: %x\n", time.Now(), net.Self().ID[:16])
 		}
 	}()
 
@@ -282,7 +282,7 @@ func (s *simulation) launchNode(log bool) *Network {
 	addr := &net.UDPAddr{IP: ip, Port: 30303}
 
 	transport := &simTransport{joinTime: time.Now(), sender: id, senderAddr: addr, sim: s, priv: key}
-	net, err := newNetwork(transport, key.PublicKey, nil, "<no database>", nil)
+	net, err := newNetwork(transport, key.PublicKey, "<no database>", nil)
 	if err != nil {
 		panic("cannot launch new node: " + err.Error())
 	}

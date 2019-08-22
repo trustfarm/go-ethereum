@@ -18,15 +18,18 @@ package hexutil
 
 import (
 	"encoding/hex"
-	"errors"
+	"encoding/json"
 	"fmt"
 	"math/big"
+	"reflect"
 	"strconv"
 )
 
 var (
-	textZero     = []byte(`0x0`)
-	errNonString = errors.New("cannot unmarshal non-string as hex data")
+	bytesT  = reflect.TypeOf(Bytes(nil))
+	bigT    = reflect.TypeOf((*Big)(nil))
+	uintT   = reflect.TypeOf(Uint(0))
+	uint64T = reflect.TypeOf(Uint64(0))
 )
 
 // Bytes marshals/unmarshals as a JSON string with 0x prefix.
@@ -44,9 +47,9 @@ func (b Bytes) MarshalText() ([]byte, error) {
 // UnmarshalJSON implements json.Unmarshaler.
 func (b *Bytes) UnmarshalJSON(input []byte) error {
 	if !isString(input) {
-		return errNonString
+		return errNonString(bytesT)
 	}
-	return b.UnmarshalText(input[1 : len(input)-1])
+	return wrapTypeError(b.UnmarshalText(input[1:len(input)-1]), bytesT)
 }
 
 // UnmarshalText implements encoding.TextUnmarshaler.
@@ -67,6 +70,35 @@ func (b *Bytes) UnmarshalText(input []byte) error {
 // String returns the hex encoding of b.
 func (b Bytes) String() string {
 	return Encode(b)
+}
+
+// ImplementsGraphQLType returns true if Bytes implements the specified GraphQL type.
+func (b Bytes) ImplementsGraphQLType(name string) bool { return name == "Bytes" }
+
+// UnmarshalGraphQL unmarshals the provided GraphQL query data.
+func (b *Bytes) UnmarshalGraphQL(input interface{}) error {
+	var err error
+	switch input := input.(type) {
+	case string:
+		data, err := Decode(input)
+		if err != nil {
+			return err
+		}
+		*b = data
+	default:
+		err = fmt.Errorf("Unexpected type for Bytes: %v", input)
+	}
+	return err
+}
+
+// UnmarshalFixedJSON decodes the input as a string with 0x prefix. The length of out
+// determines the required input length. This function is commonly used to implement the
+// UnmarshalJSON method for fixed-size types.
+func UnmarshalFixedJSON(typ reflect.Type, input, out []byte) error {
+	if !isString(input) {
+		return errNonString(typ)
+	}
+	return wrapTypeError(UnmarshalFixedText(typ.String(), input[1:len(input)-1], out), typ)
 }
 
 // UnmarshalFixedText decodes the input as a string with 0x prefix. The length of out
@@ -127,9 +159,9 @@ func (b Big) MarshalText() ([]byte, error) {
 // UnmarshalJSON implements json.Unmarshaler.
 func (b *Big) UnmarshalJSON(input []byte) error {
 	if !isString(input) {
-		return errNonString
+		return errNonString(bigT)
 	}
-	return b.UnmarshalText(input[1 : len(input)-1])
+	return wrapTypeError(b.UnmarshalText(input[1:len(input)-1]), bigT)
 }
 
 // UnmarshalText implements encoding.TextUnmarshaler
@@ -174,6 +206,25 @@ func (b *Big) String() string {
 	return EncodeBig(b.ToInt())
 }
 
+// ImplementsGraphQLType returns true if Big implements the provided GraphQL type.
+func (b Big) ImplementsGraphQLType(name string) bool { return name == "BigInt" }
+
+// UnmarshalGraphQL unmarshals the provided GraphQL query data.
+func (b *Big) UnmarshalGraphQL(input interface{}) error {
+	var err error
+	switch input := input.(type) {
+	case string:
+		return b.UnmarshalText([]byte(input))
+	case int32:
+		var num big.Int
+		num.SetInt64(int64(input))
+		*b = Big(num)
+	default:
+		err = fmt.Errorf("Unexpected type for BigInt: %v", input)
+	}
+	return err
+}
+
 // Uint64 marshals/unmarshals as a JSON string with 0x prefix.
 // The zero value marshals as "0x0".
 type Uint64 uint64
@@ -189,9 +240,9 @@ func (b Uint64) MarshalText() ([]byte, error) {
 // UnmarshalJSON implements json.Unmarshaler.
 func (b *Uint64) UnmarshalJSON(input []byte) error {
 	if !isString(input) {
-		return errNonString
+		return errNonString(uint64T)
 	}
-	return b.UnmarshalText(input[1 : len(input)-1])
+	return wrapTypeError(b.UnmarshalText(input[1:len(input)-1]), uint64T)
 }
 
 // UnmarshalText implements encoding.TextUnmarshaler
@@ -210,7 +261,7 @@ func (b *Uint64) UnmarshalText(input []byte) error {
 			return ErrSyntax
 		}
 		dec *= 16
-		dec += uint64(nib)
+		dec += nib
 	}
 	*b = Uint64(dec)
 	return nil
@@ -219,6 +270,23 @@ func (b *Uint64) UnmarshalText(input []byte) error {
 // String returns the hex encoding of b.
 func (b Uint64) String() string {
 	return EncodeUint64(uint64(b))
+}
+
+// ImplementsGraphQLType returns true if Uint64 implements the provided GraphQL type.
+func (b Uint64) ImplementsGraphQLType(name string) bool { return name == "Long" }
+
+// UnmarshalGraphQL unmarshals the provided GraphQL query data.
+func (b *Uint64) UnmarshalGraphQL(input interface{}) error {
+	var err error
+	switch input := input.(type) {
+	case string:
+		return b.UnmarshalText([]byte(input))
+	case int32:
+		*b = Uint64(input)
+	default:
+		err = fmt.Errorf("Unexpected type for Long: %v", input)
+	}
+	return err
 }
 
 // Uint marshals/unmarshals as a JSON string with 0x prefix.
@@ -233,9 +301,9 @@ func (b Uint) MarshalText() ([]byte, error) {
 // UnmarshalJSON implements json.Unmarshaler.
 func (b *Uint) UnmarshalJSON(input []byte) error {
 	if !isString(input) {
-		return errNonString
+		return errNonString(uintT)
 	}
-	return b.UnmarshalText(input[1 : len(input)-1])
+	return wrapTypeError(b.UnmarshalText(input[1:len(input)-1]), uintT)
 }
 
 // UnmarshalText implements encoding.TextUnmarshaler.
@@ -294,4 +362,15 @@ func checkNumberText(input []byte) (raw []byte, err error) {
 		return nil, ErrLeadingZero
 	}
 	return input, nil
+}
+
+func wrapTypeError(err error, typ reflect.Type) error {
+	if _, ok := err.(*decError); ok {
+		return &json.UnmarshalTypeError{Value: err.Error(), Type: typ}
+	}
+	return err
+}
+
+func errNonString(typ reflect.Type) error {
+	return &json.UnmarshalTypeError{Value: "non-string", Type: typ}
 }

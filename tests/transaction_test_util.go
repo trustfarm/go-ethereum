@@ -17,211 +17,96 @@
 package tests
 
 import (
-	"bytes"
-	"errors"
 	"fmt"
-	"io"
-	"runtime"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/common/math"
+	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
 )
 
-// Transaction Test JSON Format
-type TtTransaction struct {
-	Data     string
-	GasLimit string
-	GasPrice string
-	Nonce    string
-	R        string
-	S        string
-	To       string
-	V        string
-	Value    string
-}
-
+// TransactionTest checks RLP decoding and sender derivation of transactions.
 type TransactionTest struct {
-	Blocknumber string
-	Rlp         string
-	Sender      string
-	Transaction TtTransaction
+	RLP            hexutil.Bytes `json:"rlp"`
+	Byzantium      ttFork
+	Constantinople ttFork
+	Istanbul       ttFork
+	EIP150         ttFork
+	EIP158         ttFork
+	Frontier       ttFork
+	Homestead      ttFork
 }
 
-func RunTransactionTestsWithReader(config *params.ChainConfig, r io.Reader, skipTests []string) error {
-	skipTest := make(map[string]bool, len(skipTests))
-	for _, name := range skipTests {
-		skipTest[name] = true
-	}
-
-	bt := make(map[string]TransactionTest)
-	if err := readJson(r, &bt); err != nil {
-		return err
-	}
-
-	for name, test := range bt {
-		// if the test should be skipped, return
-		if skipTest[name] {
-			log.Info(fmt.Sprint("Skipping transaction test", name))
-			return nil
-		}
-		// test the block
-		if err := runTransactionTest(config, test); err != nil {
-			return err
-		}
-		log.Info(fmt.Sprint("Transaction test passed: ", name))
-
-	}
-	return nil
+type ttFork struct {
+	Sender common.UnprefixedAddress `json:"sender"`
+	Hash   common.UnprefixedHash    `json:"hash"`
 }
 
-func RunTransactionTests(config *params.ChainConfig, file string, skipTests []string) error {
-	tests := make(map[string]TransactionTest)
-	if err := readJsonFile(file, &tests); err != nil {
-		return err
-	}
+func (tt *TransactionTest) Run(config *params.ChainConfig) error {
 
-	if err := runTransactionTests(config, tests, skipTests); err != nil {
-		return err
-	}
-	return nil
-}
-
-func runTransactionTests(config *params.ChainConfig, tests map[string]TransactionTest, skipTests []string) error {
-	skipTest := make(map[string]bool, len(skipTests))
-	for _, name := range skipTests {
-		skipTest[name] = true
-	}
-
-	for name, test := range tests {
-		// if the test should be skipped, return
-		if skipTest[name] {
-			log.Info(fmt.Sprint("Skipping transaction test", name))
-			return nil
+	validateTx := func(rlpData hexutil.Bytes, signer types.Signer, isHomestead bool, isIstanbul bool) (*common.Address, *common.Hash, error) {
+		tx := new(types.Transaction)
+		if err := rlp.DecodeBytes(rlpData, tx); err != nil {
+			return nil, nil, err
 		}
-
-		// test the block
-		if err := runTransactionTest(config, test); err != nil {
-			return fmt.Errorf("%s: %v", name, err)
+		sender, err := types.Sender(signer, tx)
+		if err != nil {
+			return nil, nil, err
 		}
-		log.Info(fmt.Sprint("Transaction test passed: ", name))
-
-	}
-	return nil
-}
-
-func runTransactionTest(config *params.ChainConfig, txTest TransactionTest) (err error) {
-	tx := new(types.Transaction)
-	err = rlp.DecodeBytes(mustConvertBytes(txTest.Rlp), tx)
-
-	if err != nil {
-		if txTest.Sender == "" {
-			// RLP decoding failed and this is expected (test OK)
-			return nil
-		} else {
-			// RLP decoding failed but is expected to succeed (test FAIL)
-			return fmt.Errorf("RLP decoding failed when expected to succeed: %s", err)
+		// Intrinsic gas
+		requiredGas, err := core.IntrinsicGas(tx.Data(), tx.To() == nil, isHomestead, isIstanbul)
+		if err != nil {
+			return nil, nil, err
 		}
+		if requiredGas > tx.Gas() {
+			return nil, nil, fmt.Errorf("insufficient gas ( %d < %d )", tx.Gas(), requiredGas)
+		}
+		h := tx.Hash()
+		return &sender, &h, nil
 	}
 
-	validationError := verifyTxFields(config, txTest, tx)
-	if txTest.Sender == "" {
-		if validationError != nil {
-			// RLP decoding works but validation should fail (test OK)
-			return nil
-		} else {
-			// RLP decoding works but validation should fail (test FAIL)
-			// (this should not be possible but added here for completeness)
-			return errors.New("Field validations succeeded but should fail")
-		}
-	}
+	for _, testcase := range []struct {
+		name        string
+		signer      types.Signer
+		fork        ttFork
+		isHomestead bool
+		isIstanbul  bool
+	}{
+		{"Frontier", types.FrontierSigner{}, tt.Frontier, false, false},
+		{"Homestead", types.HomesteadSigner{}, tt.Homestead, true, false},
+		{"EIP150", types.HomesteadSigner{}, tt.EIP150, true, false},
+		{"EIP158", types.NewEIP155Signer(config.ChainID), tt.EIP158, true, false},
+		{"Byzantium", types.NewEIP155Signer(config.ChainID), tt.Byzantium, true, false},
+		{"Constantinople", types.NewEIP155Signer(config.ChainID), tt.Constantinople, true, false},
+		//TODO! @holiman or @rjl493456442 : enable this after tests have been updated for Istanbul
+		//{"Istanbul", types.NewEIP155Signer(config.ChainID), tt.Istanbul, true, true},
+	} {
+		sender, txhash, err := validateTx(tt.RLP, testcase.signer, testcase.isHomestead, testcase.isIstanbul)
 
-	if txTest.Sender != "" {
-		if validationError == nil {
-			// RLP decoding works and validations pass (test OK)
-			return nil
-		} else {
-			// RLP decoding works and validations pass (test FAIL)
-			return fmt.Errorf("Field validations failed after RLP decoding: %s", validationError)
+		if testcase.fork.Sender == (common.UnprefixedAddress{}) {
+			if err == nil {
+				return fmt.Errorf("Expected error, got none (address %v)[%v]", sender.String(), testcase.name)
+			}
+			continue
+		}
+		// Should resolve the right address
+		if err != nil {
+			return fmt.Errorf("Got error, expected none: %v", err)
+		}
+		if sender == nil {
+			return fmt.Errorf("sender was nil, should be %x", common.Address(testcase.fork.Sender))
+		}
+		if *sender != common.Address(testcase.fork.Sender) {
+			return fmt.Errorf("Sender mismatch: got %x, want %x", sender, testcase.fork.Sender)
+		}
+		if txhash == nil {
+			return fmt.Errorf("txhash was nil, should be %x", common.Hash(testcase.fork.Hash))
+		}
+		if *txhash != common.Hash(testcase.fork.Hash) {
+			return fmt.Errorf("Hash mismatch: got %x, want %x", *txhash, testcase.fork.Hash)
 		}
 	}
-	return errors.New("Should not happen: verify RLP decoding and field validation")
-}
-
-func verifyTxFields(chainConfig *params.ChainConfig, txTest TransactionTest, decodedTx *types.Transaction) (err error) {
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			buf := make([]byte, 64<<10)
-			buf = buf[:runtime.Stack(buf, false)]
-			err = fmt.Errorf("%v\n%s", recovered, buf)
-		}
-	}()
-
-	var decodedSender common.Address
-
-	signer := types.MakeSigner(chainConfig, math.MustParseBig256(txTest.Blocknumber))
-	decodedSender, err = types.Sender(signer, decodedTx)
-	if err != nil {
-		return err
-	}
-
-	expectedSender := mustConvertAddress(txTest.Sender)
-	if expectedSender != decodedSender {
-		return fmt.Errorf("Sender mismatch: %x %x", expectedSender, decodedSender)
-	}
-
-	expectedData := mustConvertBytes(txTest.Transaction.Data)
-	if !bytes.Equal(expectedData, decodedTx.Data()) {
-		return fmt.Errorf("Tx input data mismatch: %#v %#v", expectedData, decodedTx.Data())
-	}
-
-	expectedGasLimit := mustConvertBigInt(txTest.Transaction.GasLimit, 16)
-	if expectedGasLimit.Cmp(decodedTx.Gas()) != 0 {
-		return fmt.Errorf("GasLimit mismatch: %v %v", expectedGasLimit, decodedTx.Gas())
-	}
-
-	expectedGasPrice := mustConvertBigInt(txTest.Transaction.GasPrice, 16)
-	if expectedGasPrice.Cmp(decodedTx.GasPrice()) != 0 {
-		return fmt.Errorf("GasPrice mismatch: %v %v", expectedGasPrice, decodedTx.GasPrice())
-	}
-
-	expectedNonce := mustConvertUint(txTest.Transaction.Nonce, 16)
-	if expectedNonce != decodedTx.Nonce() {
-		return fmt.Errorf("Nonce mismatch: %v %v", expectedNonce, decodedTx.Nonce())
-	}
-
-	v, r, s := decodedTx.RawSignatureValues()
-	expectedR := mustConvertBigInt(txTest.Transaction.R, 16)
-	if r.Cmp(expectedR) != 0 {
-		return fmt.Errorf("R mismatch: %v %v", expectedR, r)
-	}
-	expectedS := mustConvertBigInt(txTest.Transaction.S, 16)
-	if s.Cmp(expectedS) != 0 {
-		return fmt.Errorf("S mismatch: %v %v", expectedS, s)
-	}
-	expectedV := mustConvertBigInt(txTest.Transaction.V, 16)
-	if v.Cmp(expectedV) != 0 {
-		return fmt.Errorf("V mismatch: %v %v", expectedV, v)
-	}
-
-	expectedTo := mustConvertAddress(txTest.Transaction.To)
-	if decodedTx.To() == nil {
-		if expectedTo != common.BytesToAddress([]byte{}) { // "empty" or "zero" address
-			return fmt.Errorf("To mismatch when recipient is nil (contract creation): %v", expectedTo)
-		}
-	} else {
-		if expectedTo != *decodedTx.To() {
-			return fmt.Errorf("To mismatch: %v %v", expectedTo, *decodedTx.To())
-		}
-	}
-
-	expectedValue := mustConvertBigInt(txTest.Transaction.Value, 16)
-	if expectedValue.Cmp(decodedTx.Value()) != 0 {
-		return fmt.Errorf("Value mismatch: %v %v", expectedValue, decodedTx.Value())
-	}
-
 	return nil
 }

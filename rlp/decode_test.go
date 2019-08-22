@@ -256,16 +256,31 @@ func TestStreamList(t *testing.T) {
 }
 
 func TestStreamRaw(t *testing.T) {
-	s := NewStream(bytes.NewReader(unhex("C58401010101")), 0)
-	s.List()
-
-	want := unhex("8401010101")
-	raw, err := s.Raw()
-	if err != nil {
-		t.Fatal(err)
+	tests := []struct {
+		input  string
+		output string
+	}{
+		{
+			"C58401010101",
+			"8401010101",
+		},
+		{
+			"F842B84001010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101",
+			"B84001010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101",
+		},
 	}
-	if !bytes.Equal(want, raw) {
-		t.Errorf("raw mismatch: got %x, want %x", raw, want)
+	for i, tt := range tests {
+		s := NewStream(bytes.NewReader(unhex(tt.input)), 0)
+		s.List()
+
+		want := unhex(tt.output)
+		raw, err := s.Raw()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(want, raw) {
+			t.Errorf("test %d: raw mismatch: got %x, want %x", i, raw, want)
+		}
 	}
 }
 
@@ -330,6 +345,12 @@ type tailRaw struct {
 type tailUint struct {
 	A    uint
 	Tail []uint `rlp:"tail"`
+}
+
+type tailPrivateFields struct {
+	A    uint
+	Tail []uint `rlp:"tail"`
+	x, y bool
 }
 
 var (
@@ -494,6 +515,11 @@ var decodeTests = []decodeTest{
 		input: "C101",
 		ptr:   new(tailRaw),
 		value: tailRaw{A: 1, Tail: []RawValue{}},
+	},
+	{
+		input: "C3010203",
+		ptr:   new(tailPrivateFields),
+		value: tailPrivateFields{A: 1, Tail: []uint{2, 3}},
 	},
 
 	// struct tag "-"
@@ -674,6 +700,27 @@ func TestDecoderInByteSlice(t *testing.T) {
 	} else if !array[0].called() {
 		t.Errorf("DecodeRLP not called for array element")
 	}
+}
+
+type unencodableDecoder func()
+
+func (f *unencodableDecoder) DecodeRLP(s *Stream) error {
+	if _, err := s.List(); err != nil {
+		return err
+	}
+	if err := s.ListEnd(); err != nil {
+		return err
+	}
+	*f = func() {}
+	return nil
+}
+
+func TestDecoderFunc(t *testing.T) {
+	var x func()
+	if err := DecodeBytes([]byte{0xC0}, (*unencodableDecoder)(&x)); err != nil {
+		t.Fatal(err)
+	}
+	x()
 }
 
 func ExampleDecode() {

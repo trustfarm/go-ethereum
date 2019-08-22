@@ -18,12 +18,15 @@ package eth
 
 import (
 	"context"
+	"errors"
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/math"
 	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/core/bloombits"
+	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
@@ -31,117 +34,140 @@ import (
 	"github.com/ethereum/go-ethereum/eth/gasprice"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/event"
-	"github.com/ethereum/go-ethereum/internal/ethapi"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rpc"
 )
 
-// EthApiBackend implements ethapi.Backend for full nodes
-type EthApiBackend struct {
-	eth *Ethereum
-	gpo *gasprice.Oracle
+// EthAPIBackend implements ethapi.Backend for full nodes
+type EthAPIBackend struct {
+	extRPCEnabled bool
+	eth           *Ethereum
+	gpo           *gasprice.Oracle
 }
 
-func (b *EthApiBackend) ChainConfig() *params.ChainConfig {
-	return b.eth.chainConfig
+// ChainConfig returns the active chain configuration.
+func (b *EthAPIBackend) ChainConfig() *params.ChainConfig {
+	return b.eth.blockchain.Config()
 }
 
-func (b *EthApiBackend) CurrentBlock() *types.Block {
+func (b *EthAPIBackend) CurrentBlock() *types.Block {
 	return b.eth.blockchain.CurrentBlock()
 }
 
-func (b *EthApiBackend) SetHead(number uint64) {
+func (b *EthAPIBackend) SetHead(number uint64) {
 	b.eth.protocolManager.downloader.Cancel()
 	b.eth.blockchain.SetHead(number)
 }
 
-func (b *EthApiBackend) HeaderByNumber(ctx context.Context, blockNr rpc.BlockNumber) (*types.Header, error) {
+func (b *EthAPIBackend) HeaderByNumber(ctx context.Context, number rpc.BlockNumber) (*types.Header, error) {
 	// Pending block is only known by the miner
-	if blockNr == rpc.PendingBlockNumber {
+	if number == rpc.PendingBlockNumber {
 		block := b.eth.miner.PendingBlock()
 		return block.Header(), nil
 	}
 	// Otherwise resolve and return the block
-	if blockNr == rpc.LatestBlockNumber {
+	if number == rpc.LatestBlockNumber {
 		return b.eth.blockchain.CurrentBlock().Header(), nil
 	}
-	return b.eth.blockchain.GetHeaderByNumber(uint64(blockNr)), nil
+	return b.eth.blockchain.GetHeaderByNumber(uint64(number)), nil
 }
 
-func (b *EthApiBackend) BlockByNumber(ctx context.Context, blockNr rpc.BlockNumber) (*types.Block, error) {
+func (b *EthAPIBackend) HeaderByHash(ctx context.Context, hash common.Hash) (*types.Header, error) {
+	return b.eth.blockchain.GetHeaderByHash(hash), nil
+}
+
+func (b *EthAPIBackend) BlockByNumber(ctx context.Context, number rpc.BlockNumber) (*types.Block, error) {
 	// Pending block is only known by the miner
-	if blockNr == rpc.PendingBlockNumber {
+	if number == rpc.PendingBlockNumber {
 		block := b.eth.miner.PendingBlock()
 		return block, nil
 	}
 	// Otherwise resolve and return the block
-	if blockNr == rpc.LatestBlockNumber {
+	if number == rpc.LatestBlockNumber {
 		return b.eth.blockchain.CurrentBlock(), nil
 	}
-	return b.eth.blockchain.GetBlockByNumber(uint64(blockNr)), nil
+	return b.eth.blockchain.GetBlockByNumber(uint64(number)), nil
 }
 
-func (b *EthApiBackend) StateAndHeaderByNumber(ctx context.Context, blockNr rpc.BlockNumber) (ethapi.State, *types.Header, error) {
+func (b *EthAPIBackend) BlockByHash(ctx context.Context, hash common.Hash) (*types.Block, error) {
+	return b.eth.blockchain.GetBlockByHash(hash), nil
+}
+
+func (b *EthAPIBackend) StateAndHeaderByNumber(ctx context.Context, number rpc.BlockNumber) (*state.StateDB, *types.Header, error) {
 	// Pending state is only known by the miner
-	if blockNr == rpc.PendingBlockNumber {
+	if number == rpc.PendingBlockNumber {
 		block, state := b.eth.miner.Pending()
-		return EthApiState{state}, block.Header(), nil
+		return state, block.Header(), nil
 	}
 	// Otherwise resolve the block number and return its state
-	header, err := b.HeaderByNumber(ctx, blockNr)
-	if header == nil || err != nil {
+	header, err := b.HeaderByNumber(ctx, number)
+	if err != nil {
 		return nil, nil, err
 	}
+	if header == nil {
+		return nil, nil, errors.New("header not found")
+	}
 	stateDb, err := b.eth.BlockChain().StateAt(header.Root)
-	return EthApiState{stateDb}, header, err
+	return stateDb, header, err
 }
 
-func (b *EthApiBackend) GetBlock(ctx context.Context, blockHash common.Hash) (*types.Block, error) {
-	return b.eth.blockchain.GetBlockByHash(blockHash), nil
+func (b *EthAPIBackend) GetReceipts(ctx context.Context, hash common.Hash) (types.Receipts, error) {
+	return b.eth.blockchain.GetReceiptsByHash(hash), nil
 }
 
-func (b *EthApiBackend) GetReceipts(ctx context.Context, blockHash common.Hash) (types.Receipts, error) {
-	return core.GetBlockReceipts(b.eth.chainDb, blockHash, core.GetBlockNumber(b.eth.chainDb, blockHash)), nil
+func (b *EthAPIBackend) GetLogs(ctx context.Context, hash common.Hash) ([][]*types.Log, error) {
+	receipts := b.eth.blockchain.GetReceiptsByHash(hash)
+	if receipts == nil {
+		return nil, nil
+	}
+	logs := make([][]*types.Log, len(receipts))
+	for i, receipt := range receipts {
+		logs[i] = receipt.Logs
+	}
+	return logs, nil
 }
 
-func (b *EthApiBackend) GetTd(blockHash common.Hash) *big.Int {
+func (b *EthAPIBackend) GetTd(blockHash common.Hash) *big.Int {
 	return b.eth.blockchain.GetTdByHash(blockHash)
 }
 
-func (b *EthApiBackend) GetEVM(ctx context.Context, msg core.Message, state ethapi.State, header *types.Header, vmCfg vm.Config) (*vm.EVM, func() error, error) {
-	statedb := state.(EthApiState).state
-	from := statedb.GetOrNewStateObject(msg.From())
-	from.SetBalance(math.MaxBig256)
+func (b *EthAPIBackend) GetEVM(ctx context.Context, msg core.Message, state *state.StateDB, header *types.Header) (*vm.EVM, func() error, error) {
+	state.SetBalance(msg.From(), math.MaxBig256)
 	vmError := func() error { return nil }
 
 	context := core.NewEVMContext(msg, header, b.eth.BlockChain(), nil)
-	return vm.NewEVM(context, statedb, b.eth.chainConfig, vmCfg), vmError, nil
+	return vm.NewEVM(context, state, b.eth.blockchain.Config(), *b.eth.blockchain.GetVMConfig()), vmError, nil
 }
 
-func (b *EthApiBackend) SendTx(ctx context.Context, signedTx *types.Transaction) error {
-	b.eth.txMu.Lock()
-	defer b.eth.txMu.Unlock()
-
-	b.eth.txPool.SetLocal(signedTx)
-	return b.eth.txPool.Add(signedTx)
+func (b *EthAPIBackend) SubscribeRemovedLogsEvent(ch chan<- core.RemovedLogsEvent) event.Subscription {
+	return b.eth.BlockChain().SubscribeRemovedLogsEvent(ch)
 }
 
-func (b *EthApiBackend) RemoveTx(txHash common.Hash) {
-	b.eth.txMu.Lock()
-	defer b.eth.txMu.Unlock()
-
-	b.eth.txPool.Remove(txHash)
+func (b *EthAPIBackend) SubscribeChainEvent(ch chan<- core.ChainEvent) event.Subscription {
+	return b.eth.BlockChain().SubscribeChainEvent(ch)
 }
 
-func (b *EthApiBackend) GetPoolTransactions() (types.Transactions, error) {
-	b.eth.txMu.Lock()
-	defer b.eth.txMu.Unlock()
+func (b *EthAPIBackend) SubscribeChainHeadEvent(ch chan<- core.ChainHeadEvent) event.Subscription {
+	return b.eth.BlockChain().SubscribeChainHeadEvent(ch)
+}
 
+func (b *EthAPIBackend) SubscribeChainSideEvent(ch chan<- core.ChainSideEvent) event.Subscription {
+	return b.eth.BlockChain().SubscribeChainSideEvent(ch)
+}
+
+func (b *EthAPIBackend) SubscribeLogsEvent(ch chan<- []*types.Log) event.Subscription {
+	return b.eth.BlockChain().SubscribeLogsEvent(ch)
+}
+
+func (b *EthAPIBackend) SendTx(ctx context.Context, signedTx *types.Transaction) error {
+	return b.eth.txPool.AddLocal(signedTx)
+}
+
+func (b *EthAPIBackend) GetPoolTransactions() (types.Transactions, error) {
 	pending, err := b.eth.txPool.Pending()
 	if err != nil {
 		return nil, err
 	}
-
 	var txs types.Transactions
 	for _, batch := range pending {
 		txs = append(txs, batch...)
@@ -149,74 +175,70 @@ func (b *EthApiBackend) GetPoolTransactions() (types.Transactions, error) {
 	return txs, nil
 }
 
-func (b *EthApiBackend) GetPoolTransaction(hash common.Hash) *types.Transaction {
-	b.eth.txMu.Lock()
-	defer b.eth.txMu.Unlock()
-
+func (b *EthAPIBackend) GetPoolTransaction(hash common.Hash) *types.Transaction {
 	return b.eth.txPool.Get(hash)
 }
 
-func (b *EthApiBackend) GetPoolNonce(ctx context.Context, addr common.Address) (uint64, error) {
-	b.eth.txMu.Lock()
-	defer b.eth.txMu.Unlock()
-
-	return b.eth.txPool.State().GetNonce(addr), nil
+func (b *EthAPIBackend) GetTransaction(ctx context.Context, txHash common.Hash) (*types.Transaction, common.Hash, uint64, uint64, error) {
+	tx, blockHash, blockNumber, index := rawdb.ReadTransaction(b.eth.ChainDb(), txHash)
+	return tx, blockHash, blockNumber, index, nil
 }
 
-func (b *EthApiBackend) Stats() (pending int, queued int) {
-	b.eth.txMu.Lock()
-	defer b.eth.txMu.Unlock()
+func (b *EthAPIBackend) GetPoolNonce(ctx context.Context, addr common.Address) (uint64, error) {
+	return b.eth.txPool.Nonce(addr), nil
+}
 
+func (b *EthAPIBackend) Stats() (pending int, queued int) {
 	return b.eth.txPool.Stats()
 }
 
-func (b *EthApiBackend) TxPoolContent() (map[common.Address]types.Transactions, map[common.Address]types.Transactions) {
-	b.eth.txMu.Lock()
-	defer b.eth.txMu.Unlock()
-
+func (b *EthAPIBackend) TxPoolContent() (map[common.Address]types.Transactions, map[common.Address]types.Transactions) {
 	return b.eth.TxPool().Content()
 }
 
-func (b *EthApiBackend) Downloader() *downloader.Downloader {
+func (b *EthAPIBackend) SubscribeNewTxsEvent(ch chan<- core.NewTxsEvent) event.Subscription {
+	return b.eth.TxPool().SubscribeNewTxsEvent(ch)
+}
+
+func (b *EthAPIBackend) Downloader() *downloader.Downloader {
 	return b.eth.Downloader()
 }
 
-func (b *EthApiBackend) ProtocolVersion() int {
+func (b *EthAPIBackend) ProtocolVersion() int {
 	return b.eth.EthVersion()
 }
 
-func (b *EthApiBackend) SuggestPrice(ctx context.Context) (*big.Int, error) {
+func (b *EthAPIBackend) SuggestPrice(ctx context.Context) (*big.Int, error) {
 	return b.gpo.SuggestPrice(ctx)
 }
 
-func (b *EthApiBackend) ChainDb() ethdb.Database {
+func (b *EthAPIBackend) ChainDb() ethdb.Database {
 	return b.eth.ChainDb()
 }
 
-func (b *EthApiBackend) EventMux() *event.TypeMux {
+func (b *EthAPIBackend) EventMux() *event.TypeMux {
 	return b.eth.EventMux()
 }
 
-func (b *EthApiBackend) AccountManager() *accounts.Manager {
+func (b *EthAPIBackend) AccountManager() *accounts.Manager {
 	return b.eth.AccountManager()
 }
 
-type EthApiState struct {
-	state *state.StateDB
+func (b *EthAPIBackend) ExtRPCEnabled() bool {
+	return b.extRPCEnabled
 }
 
-func (s EthApiState) GetBalance(ctx context.Context, addr common.Address) (*big.Int, error) {
-	return s.state.GetBalance(addr), nil
+func (b *EthAPIBackend) RPCGasCap() *big.Int {
+	return b.eth.config.RPCGasCap
 }
 
-func (s EthApiState) GetCode(ctx context.Context, addr common.Address) ([]byte, error) {
-	return s.state.GetCode(addr), nil
+func (b *EthAPIBackend) BloomStatus() (uint64, uint64) {
+	sections, _, _ := b.eth.bloomIndexer.Sections()
+	return params.BloomBitsBlocks, sections
 }
 
-func (s EthApiState) GetState(ctx context.Context, a common.Address, b common.Hash) (common.Hash, error) {
-	return s.state.GetState(a, b), nil
-}
-
-func (s EthApiState) GetNonce(ctx context.Context, addr common.Address) (uint64, error) {
-	return s.state.GetNonce(addr), nil
+func (b *EthAPIBackend) ServiceFilter(ctx context.Context, session *bloombits.MatcherSession) {
+	for i := 0; i < bloomFilterThreads; i++ {
+		go session.Multiplex(bloomRetrievalBatch, bloomRetrievalWait, b.eth.bloomRequests)
+	}
 }

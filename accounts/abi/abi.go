@@ -17,13 +17,10 @@
 package abi
 
 import (
-	"encoding/binary"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
-	"math/big"
-	"reflect"
-	"strings"
 
 	"github.com/ethereum/go-ethereum/common"
 )
@@ -56,338 +53,77 @@ func JSON(reader io.Reader) (ABI, error) {
 // methods string signature. (signature = baz(uint32,string32))
 func (abi ABI) Pack(name string, args ...interface{}) ([]byte, error) {
 	// Fetch the ABI of the requested method
-	var method Method
-
 	if name == "" {
-		method = abi.Constructor
-	} else {
-		m, exist := abi.Methods[name]
-		if !exist {
-			return nil, fmt.Errorf("method '%s' not found", name)
+		// constructor
+		arguments, err := abi.Constructor.Inputs.Pack(args...)
+		if err != nil {
+			return nil, err
 		}
-		method = m
+		return arguments, nil
 	}
-	arguments, err := method.pack(method, args...)
+	method, exist := abi.Methods[name]
+	if !exist {
+		return nil, fmt.Errorf("method '%s' not found", name)
+	}
+	arguments, err := method.Inputs.Pack(args...)
 	if err != nil {
 		return nil, err
 	}
 	// Pack up the method ID too if not a constructor and return
-	if name == "" {
-		return arguments, nil
-	}
-	return append(method.Id(), arguments...), nil
+	return append(method.ID(), arguments...), nil
 }
-
-// toGoSliceType parses the input and casts it to the proper slice defined by the ABI
-// argument in T.
-func toGoSlice(i int, t Argument, output []byte) (interface{}, error) {
-	index := i * 32
-	// The slice must, at very least be large enough for the index+32 which is exactly the size required
-	// for the [offset in output, size of offset].
-	if index+32 > len(output) {
-		return nil, fmt.Errorf("abi: cannot marshal in to go slice: insufficient size output %d require %d", len(output), index+32)
-	}
-	elem := t.Type.Elem
-
-	// first we need to create a slice of the type
-	var refSlice reflect.Value
-	switch elem.T {
-	case IntTy, UintTy, BoolTy:
-		// create a new reference slice matching the element type
-		switch t.Type.Kind {
-		case reflect.Bool:
-			refSlice = reflect.ValueOf([]bool(nil))
-		case reflect.Uint8:
-			refSlice = reflect.ValueOf([]uint8(nil))
-		case reflect.Uint16:
-			refSlice = reflect.ValueOf([]uint16(nil))
-		case reflect.Uint32:
-			refSlice = reflect.ValueOf([]uint32(nil))
-		case reflect.Uint64:
-			refSlice = reflect.ValueOf([]uint64(nil))
-		case reflect.Int8:
-			refSlice = reflect.ValueOf([]int8(nil))
-		case reflect.Int16:
-			refSlice = reflect.ValueOf([]int16(nil))
-		case reflect.Int32:
-			refSlice = reflect.ValueOf([]int32(nil))
-		case reflect.Int64:
-			refSlice = reflect.ValueOf([]int64(nil))
-		default:
-			refSlice = reflect.ValueOf([]*big.Int(nil))
-		}
-	case AddressTy: // address must be of slice Address
-		refSlice = reflect.ValueOf([]common.Address(nil))
-	case HashTy: // hash must be of slice hash
-		refSlice = reflect.ValueOf([]common.Hash(nil))
-	case FixedBytesTy:
-		refSlice = reflect.ValueOf([][]byte(nil))
-	default: // no other types are supported
-		return nil, fmt.Errorf("abi: unsupported slice type %v", elem.T)
-	}
-
-	var slice []byte
-	var size int
-	var offset int
-	if t.Type.IsSlice {
-		// get the offset which determines the start of this array ...
-		offset = int(binary.BigEndian.Uint64(output[index+24 : index+32]))
-		if offset+32 > len(output) {
-			return nil, fmt.Errorf("abi: cannot marshal in to go slice: offset %d would go over slice boundary (len=%d)", len(output), offset+32)
-		}
-
-		slice = output[offset:]
-		// ... starting with the size of the array in elements ...
-		size = int(binary.BigEndian.Uint64(slice[24:32]))
-		slice = slice[32:]
-		// ... and make sure that we've at the very least the amount of bytes
-		// available in the buffer.
-		if size*32 > len(slice) {
-			return nil, fmt.Errorf("abi: cannot marshal in to go slice: insufficient size output %d require %d", len(output), offset+32+size*32)
-		}
-
-		// reslice to match the required size
-		slice = slice[:size*32]
-	} else if t.Type.IsArray {
-		//get the number of elements in the array
-		size = t.Type.SliceSize
-
-		//check to make sure array size matches up
-		if index+32*size > len(output) {
-			return nil, fmt.Errorf("abi: cannot marshal in to go array: offset %d would go over slice boundary (len=%d)", len(output), index+32*size)
-		}
-		//slice is there for a fixed amount of times
-		slice = output[index : index+size*32]
-	}
-
-	for i := 0; i < size; i++ {
-		var (
-			inter        interface{}             // interface type
-			returnOutput = slice[i*32 : i*32+32] // the return output
-		)
-		// set inter to the correct type (cast)
-		switch elem.T {
-		case IntTy, UintTy:
-			inter = readInteger(t.Type.Kind, returnOutput)
-		case BoolTy:
-			inter = !allZero(returnOutput)
-		case AddressTy:
-			inter = common.BytesToAddress(returnOutput)
-		case HashTy:
-			inter = common.BytesToHash(returnOutput)
-		case FixedBytesTy:
-			inter = returnOutput
-		}
-		// append the item to our reflect slice
-		refSlice = reflect.Append(refSlice, reflect.ValueOf(inter))
-	}
-
-	// return the interface
-	return refSlice.Interface(), nil
-}
-
-func readInteger(kind reflect.Kind, b []byte) interface{} {
-	switch kind {
-	case reflect.Uint8:
-		return uint8(b[len(b)-1])
-	case reflect.Uint16:
-		return binary.BigEndian.Uint16(b[len(b)-2:])
-	case reflect.Uint32:
-		return binary.BigEndian.Uint32(b[len(b)-4:])
-	case reflect.Uint64:
-		return binary.BigEndian.Uint64(b[len(b)-8:])
-	case reflect.Int8:
-		return int8(b[len(b)-1])
-	case reflect.Int16:
-		return int16(binary.BigEndian.Uint16(b[len(b)-2:]))
-	case reflect.Int32:
-		return int32(binary.BigEndian.Uint32(b[len(b)-4:]))
-	case reflect.Int64:
-		return int64(binary.BigEndian.Uint64(b[len(b)-8:]))
-	default:
-		return new(big.Int).SetBytes(b)
-	}
-}
-
-func allZero(b []byte) bool {
-	for _, byte := range b {
-		if byte != 0 {
-			return false
-		}
-	}
-	return true
-}
-
-// toGoType parses the input and casts it to the proper type defined by the ABI
-// argument in T.
-func toGoType(i int, t Argument, output []byte) (interface{}, error) {
-	// we need to treat slices differently
-	if (t.Type.IsSlice || t.Type.IsArray) && t.Type.T != BytesTy && t.Type.T != StringTy && t.Type.T != FixedBytesTy && t.Type.T != FunctionTy {
-		return toGoSlice(i, t, output)
-	}
-
-	index := i * 32
-	if index+32 > len(output) {
-		return nil, fmt.Errorf("abi: cannot marshal in to go type: length insufficient %d require %d", len(output), index+32)
-	}
-
-	// Parse the given index output and check whether we need to read
-	// a different offset and length based on the type (i.e. string, bytes)
-	var returnOutput []byte
-	switch t.Type.T {
-	case StringTy, BytesTy: // variable arrays are written at the end of the return bytes
-		// parse offset from which we should start reading
-		offset := int(binary.BigEndian.Uint64(output[index+24 : index+32]))
-		if offset+32 > len(output) {
-			return nil, fmt.Errorf("abi: cannot marshal in to go type: length insufficient %d require %d", len(output), offset+32)
-		}
-		// parse the size up until we should be reading
-		size := int(binary.BigEndian.Uint64(output[offset+24 : offset+32]))
-		if offset+32+size > len(output) {
-			return nil, fmt.Errorf("abi: cannot marshal in to go type: length insufficient %d require %d", len(output), offset+32+size)
-		}
-
-		// get the bytes for this return value
-		returnOutput = output[offset+32 : offset+32+size]
-	default:
-		returnOutput = output[index : index+32]
-	}
-
-	// convert the bytes to whatever is specified by the ABI.
-	switch t.Type.T {
-	case IntTy, UintTy:
-		return readInteger(t.Type.Kind, returnOutput), nil
-	case BoolTy:
-		return !allZero(returnOutput), nil
-	case AddressTy:
-		return common.BytesToAddress(returnOutput), nil
-	case HashTy:
-		return common.BytesToHash(returnOutput), nil
-	case BytesTy, FixedBytesTy, FunctionTy:
-		return returnOutput, nil
-	case StringTy:
-		return string(returnOutput), nil
-	}
-	return nil, fmt.Errorf("abi: unknown type %v", t.Type.T)
-}
-
-// these variable are used to determine certain types during type assertion for
-// assignment.
-var (
-	r_interSlice = reflect.TypeOf([]interface{}{})
-	r_hash       = reflect.TypeOf(common.Hash{})
-	r_bytes      = reflect.TypeOf([]byte{})
-	r_byte       = reflect.TypeOf(byte(0))
-)
 
 // Unpack output in v according to the abi specification
-func (abi ABI) Unpack(v interface{}, name string, output []byte) error {
-	var method = abi.Methods[name]
-
-	if len(output) == 0 {
+func (abi ABI) Unpack(v interface{}, name string, data []byte) (err error) {
+	if len(data) == 0 {
 		return fmt.Errorf("abi: unmarshalling empty output")
 	}
-
-	// make sure the passed value is a pointer
-	valueOf := reflect.ValueOf(v)
-	if reflect.Ptr != valueOf.Kind() {
-		return fmt.Errorf("abi: Unpack(non-pointer %T)", v)
+	// since there can't be naming collisions with contracts and events,
+	// we need to decide whether we're calling a method or an event
+	if method, ok := abi.Methods[name]; ok {
+		if len(data)%32 != 0 {
+			return fmt.Errorf("abi: improperly formatted output: %s - Bytes: [%+v]", string(data), data)
+		}
+		return method.Outputs.Unpack(v, data)
 	}
-
-	var (
-		value = valueOf.Elem()
-		typ   = value.Type()
-	)
-
-	if len(method.Outputs) > 1 {
-		switch value.Kind() {
-		// struct will match named return values to the struct's field
-		// names
-		case reflect.Struct:
-			for i := 0; i < len(method.Outputs); i++ {
-				marshalledValue, err := toGoType(i, method.Outputs[i], output)
-				if err != nil {
-					return err
-				}
-				reflectValue := reflect.ValueOf(marshalledValue)
-
-				for j := 0; j < typ.NumField(); j++ {
-					field := typ.Field(j)
-					// TODO read tags: `abi:"fieldName"`
-					if field.Name == strings.ToUpper(method.Outputs[i].Name[:1])+method.Outputs[i].Name[1:] {
-						if err := set(value.Field(j), reflectValue, method.Outputs[i]); err != nil {
-							return err
-						}
-					}
-				}
-			}
-		case reflect.Slice:
-			if !value.Type().AssignableTo(r_interSlice) {
-				return fmt.Errorf("abi: cannot marshal tuple in to slice %T (only []interface{} is supported)", v)
-			}
-
-			// if the slice already contains values, set those instead of the interface slice itself.
-			if value.Len() > 0 {
-				if len(method.Outputs) > value.Len() {
-					return fmt.Errorf("abi: cannot marshal in to slices of unequal size (require: %v, got: %v)", len(method.Outputs), value.Len())
-				}
-
-				for i := 0; i < len(method.Outputs); i++ {
-					marshalledValue, err := toGoType(i, method.Outputs[i], output)
-					if err != nil {
-						return err
-					}
-					reflectValue := reflect.ValueOf(marshalledValue)
-					if err := set(value.Index(i).Elem(), reflectValue, method.Outputs[i]); err != nil {
-						return err
-					}
-				}
-				return nil
-			}
-
-			// create a new slice and start appending the unmarshalled
-			// values to the new interface slice.
-			z := reflect.MakeSlice(typ, 0, len(method.Outputs))
-			for i := 0; i < len(method.Outputs); i++ {
-				marshalledValue, err := toGoType(i, method.Outputs[i], output)
-				if err != nil {
-					return err
-				}
-				z = reflect.Append(z, reflect.ValueOf(marshalledValue))
-			}
-			value.Set(z)
-		default:
-			return fmt.Errorf("abi: cannot unmarshal tuple in to %v", typ)
-		}
-
-	} else {
-		marshalledValue, err := toGoType(0, method.Outputs[0], output)
-		if err != nil {
-			return err
-		}
-		if err := set(value, reflect.ValueOf(marshalledValue), method.Outputs[0]); err != nil {
-			return err
-		}
+	if event, ok := abi.Events[name]; ok {
+		return event.Inputs.Unpack(v, data)
 	}
-
-	return nil
+	return fmt.Errorf("abi: could not locate named method or event")
 }
 
+// UnpackIntoMap unpacks a log into the provided map[string]interface{}
+func (abi ABI) UnpackIntoMap(v map[string]interface{}, name string, data []byte) (err error) {
+	if len(data) == 0 {
+		return fmt.Errorf("abi: unmarshalling empty output")
+	}
+	// since there can't be naming collisions with contracts and events,
+	// we need to decide whether we're calling a method or an event
+	if method, ok := abi.Methods[name]; ok {
+		if len(data)%32 != 0 {
+			return fmt.Errorf("abi: improperly formatted output")
+		}
+		return method.Outputs.UnpackIntoMap(v, data)
+	}
+	if event, ok := abi.Events[name]; ok {
+		return event.Inputs.UnpackIntoMap(v, data)
+	}
+	return fmt.Errorf("abi: could not locate named method or event")
+}
+
+// UnmarshalJSON implements json.Unmarshaler interface
 func (abi *ABI) UnmarshalJSON(data []byte) error {
 	var fields []struct {
 		Type      string
 		Name      string
 		Constant  bool
-		Indexed   bool
 		Anonymous bool
 		Inputs    []Argument
 		Outputs   []Argument
 	}
-
 	if err := json.Unmarshal(data, &fields); err != nil {
 		return err
 	}
-
 	abi.Methods = make(map[string]Method)
 	abi.Events = make(map[string]Event)
 	for _, field := range fields {
@@ -398,15 +134,29 @@ func (abi *ABI) UnmarshalJSON(data []byte) error {
 			}
 		// empty defaults to function according to the abi spec
 		case "function", "":
-			abi.Methods[field.Name] = Method{
-				Name:    field.Name,
+			name := field.Name
+			_, ok := abi.Methods[name]
+			for idx := 0; ok; idx++ {
+				name = fmt.Sprintf("%s%d", field.Name, idx)
+				_, ok = abi.Methods[name]
+			}
+			abi.Methods[name] = Method{
+				Name:    name,
+				RawName: field.Name,
 				Const:   field.Constant,
 				Inputs:  field.Inputs,
 				Outputs: field.Outputs,
 			}
 		case "event":
-			abi.Events[field.Name] = Event{
-				Name:      field.Name,
+			name := field.Name
+			_, ok := abi.Events[name]
+			for idx := 0; ok; idx++ {
+				name = fmt.Sprintf("%s%d", field.Name, idx)
+				_, ok = abi.Events[name]
+			}
+			abi.Events[name] = Event{
+				Name:      name,
+				RawName:   field.Name,
 				Anonymous: field.Anonymous,
 				Inputs:    field.Inputs,
 			}
@@ -414,4 +164,29 @@ func (abi *ABI) UnmarshalJSON(data []byte) error {
 	}
 
 	return nil
+}
+
+// MethodById looks up a method by the 4-byte id
+// returns nil if none found
+func (abi *ABI) MethodById(sigdata []byte) (*Method, error) {
+	if len(sigdata) < 4 {
+		return nil, fmt.Errorf("data too short (%d bytes) for abi method lookup", len(sigdata))
+	}
+	for _, method := range abi.Methods {
+		if bytes.Equal(method.ID(), sigdata[:4]) {
+			return &method, nil
+		}
+	}
+	return nil, fmt.Errorf("no method with id: %#x", sigdata[:4])
+}
+
+// EventByID looks an event up by its topic hash in the
+// ABI and returns nil if none found.
+func (abi *ABI) EventByID(topic common.Hash) (*Event, error) {
+	for _, event := range abi.Events {
+		if bytes.Equal(event.ID().Bytes(), topic.Bytes()) {
+			return &event, nil
+		}
+	}
+	return nil, fmt.Errorf("no event with id: %#x", topic.Hex())
 }

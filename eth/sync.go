@@ -25,7 +25,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/eth/downloader"
 	"github.com/ethereum/go-ethereum/log"
-	"github.com/ethereum/go-ethereum/p2p/discover"
+	"github.com/ethereum/go-ethereum/p2p/enode"
 )
 
 const (
@@ -64,7 +64,7 @@ func (pm *ProtocolManager) syncTransactions(p *peer) {
 // the transactions in small packs to one peer at a time.
 func (pm *ProtocolManager) txsyncLoop() {
 	var (
-		pending = make(map[discover.NodeID]*txsync)
+		pending = make(map[enode.ID]*txsync)
 		sending = false               // whether a send is active
 		pack    = new(txsync)         // the pack that is being sent
 		done    = make(chan error, 1) // result of the send
@@ -138,7 +138,9 @@ func (pm *ProtocolManager) syncer() {
 	defer pm.downloader.Terminate()
 
 	// Wait for different events to fire synchronisation operations
-	forceSync := time.Tick(forceSyncCycle)
+	forceSync := time.NewTicker(forceSyncCycle)
+	defer forceSync.Stop()
+
 	for {
 		select {
 		case <-pm.newPeerCh:
@@ -148,7 +150,7 @@ func (pm *ProtocolManager) syncer() {
 			}
 			go pm.synchronise(pm.peers.BestPeer())
 
-		case <-forceSync:
+		case <-forceSync.C:
 			// Force a sync even if not enough peers are present
 			go pm.synchronise(pm.peers.BestPeer())
 
@@ -177,20 +179,32 @@ func (pm *ProtocolManager) synchronise(peer *peer) {
 	if atomic.LoadUint32(&pm.fastSync) == 1 {
 		// Fast sync was explicitly requested, and explicitly granted
 		mode = downloader.FastSync
-	} else if currentBlock.NumberU64() == 0 && pm.blockchain.CurrentFastBlock().NumberU64() > 0 {
-		// The database seems empty as the current block is the genesis. Yet the fast
-		// block is ahead, so fast sync was enabled for this node at a certain point.
-		// The only scenario where this can happen is if the user manually (or via a
-		// bad block) rolled back a fast sync node below the sync point. In this case
-		// however it's safe to reenable fast sync.
-		atomic.StoreUint32(&pm.fastSync, 1)
-		mode = downloader.FastSync
 	}
+	if mode == downloader.FastSync {
+		// Make sure the peer's total difficulty we are synchronizing is higher.
+		if pm.blockchain.GetTdByHash(pm.blockchain.CurrentFastBlock().Hash()).Cmp(pTd) >= 0 {
+			return
+		}
+	}
+	// Run the sync cycle, and disable fast sync if we've went past the pivot block
 	if err := pm.downloader.Synchronise(peer.id, pHead, pTd, mode); err != nil {
 		return
 	}
-	atomic.StoreUint32(&pm.acceptTxs, 1) // Mark initial sync done
-	if head := pm.blockchain.CurrentBlock(); head.NumberU64() > 0 {
+	if atomic.LoadUint32(&pm.fastSync) == 1 {
+		log.Info("Fast sync complete, auto disabling")
+		atomic.StoreUint32(&pm.fastSync, 0)
+	}
+	// If we've successfully finished a sync cycle and passed any required checkpoint,
+	// enable accepting transactions from the network.
+	head := pm.blockchain.CurrentBlock()
+	if head.NumberU64() >= pm.checkpointNumber {
+		// Checkpoint passed, sanity check the timestamp to have a fallback mechanism
+		// for non-checkpointed (number = 0) private networks.
+		if head.Time() >= uint64(time.Now().AddDate(0, -1, 0).Unix()) {
+			atomic.StoreUint32(&pm.acceptTxs, 1)
+		}
+	}
+	if head.NumberU64() > 0 {
 		// We've completed a sync cycle, notify all peers of new state. This path is
 		// essential in star-topology networks where a gateway node needs to notify
 		// all its out-of-date peers of the availability of a new block. This failure
@@ -198,13 +212,5 @@ func (pm *ProtocolManager) synchronise(peer *peer) {
 		// degenerate connectivity, but it should be healthy for the mainnet too to
 		// more reliably update peers or the local TD state.
 		go pm.BroadcastBlock(head, false)
-	}
-	// If fast sync was enabled, and we synced up, disable it
-	if atomic.LoadUint32(&pm.fastSync) == 1 {
-		// Disable fast sync if we indeed have something in our chain
-		if pm.blockchain.CurrentBlock().NumberU64() > 0 {
-			log.Info("Fast sync complete, auto disabling")
-			atomic.StoreUint32(&pm.fastSync, 0)
-		}
 	}
 }

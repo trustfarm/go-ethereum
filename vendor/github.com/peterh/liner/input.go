@@ -113,7 +113,7 @@ func (s *State) nextPending(timeout <-chan time.Time) (rune, error) {
 	select {
 	case thing, ok := <-s.next:
 		if !ok {
-			return 0, errors.New("liner: internal error")
+			return 0, ErrInternal
 		}
 		if thing.err != nil {
 			return 0, thing.err
@@ -137,7 +137,7 @@ func (s *State) readNext() (interface{}, error) {
 	select {
 	case thing, ok := <-s.next:
 		if !ok {
-			return 0, errors.New("liner: internal error")
+			return 0, ErrInternal
 		}
 		if thing.err != nil {
 			return nil, thing.err
@@ -264,9 +264,9 @@ func (s *State) readNext() (interface{}, error) {
 						return pageUp, nil
 					case 6:
 						return pageDown, nil
-					case 7:
+					case 1, 7:
 						return home, nil
-					case 8:
+					case 4, 8:
 						return end, nil
 					case 15:
 						return f5, nil
@@ -328,6 +328,9 @@ func (s *State) readNext() (interface{}, error) {
 	case 'b':
 		s.pending = s.pending[:0] // escape code complete
 		return altB, nil
+	case 'd':
+		s.pending = s.pending[:0] // escape code complete
+		return altD, nil
 	case 'f':
 		s.pending = s.pending[:0] // escape code complete
 		return altF, nil

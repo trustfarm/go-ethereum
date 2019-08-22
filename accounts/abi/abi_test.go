@@ -18,8 +18,8 @@ package abi
 
 import (
 	"bytes"
+	"encoding/hex"
 	"fmt"
-	"log"
 	"math/big"
 	"reflect"
 	"strings"
@@ -28,431 +28,6 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 )
-
-// formatSilceOutput add padding to the value and adds a size
-func formatSliceOutput(v ...[]byte) []byte {
-	off := common.LeftPadBytes(big.NewInt(int64(len(v))).Bytes(), 32)
-	output := append(off, make([]byte, 0, len(v)*32)...)
-
-	for _, value := range v {
-		output = append(output, common.LeftPadBytes(value, 32)...)
-	}
-	return output
-}
-
-// quick helper padding
-func pad(input []byte, size int, left bool) []byte {
-	if left {
-		return common.LeftPadBytes(input, size)
-	}
-	return common.RightPadBytes(input, size)
-}
-
-func TestTypeCheck(t *testing.T) {
-	for i, test := range []struct {
-		typ   string
-		input interface{}
-		err   string
-	}{
-		{"uint", big.NewInt(1), ""},
-		{"int", big.NewInt(1), ""},
-		{"uint30", big.NewInt(1), ""},
-		{"uint30", uint8(1), "abi: cannot use uint8 as type ptr as argument"},
-		{"uint16", uint16(1), ""},
-		{"uint16", uint8(1), "abi: cannot use uint8 as type uint16 as argument"},
-		{"uint16[]", []uint16{1, 2, 3}, ""},
-		{"uint16[]", [3]uint16{1, 2, 3}, ""},
-		{"uint16[]", []uint32{1, 2, 3}, "abi: cannot use []uint32 as type []uint16 as argument"},
-		{"uint16[3]", [3]uint32{1, 2, 3}, "abi: cannot use [3]uint32 as type [3]uint16 as argument"},
-		{"uint16[3]", [4]uint16{1, 2, 3}, "abi: cannot use [4]uint16 as type [3]uint16 as argument"},
-		{"uint16[3]", []uint16{1, 2, 3}, ""},
-		{"uint16[3]", []uint16{1, 2, 3, 4}, "abi: cannot use [4]uint16 as type [3]uint16 as argument"},
-		{"address[]", []common.Address{{1}}, ""},
-		{"address[1]", []common.Address{{1}}, ""},
-		{"address[1]", [1]common.Address{{1}}, ""},
-		{"address[2]", [1]common.Address{{1}}, "abi: cannot use [1]array as type [2]array as argument"},
-		{"bytes32", [32]byte{}, ""},
-		{"bytes32", [33]byte{}, "abi: cannot use [33]uint8 as type [32]uint8 as argument"},
-		{"bytes32", common.Hash{1}, ""},
-		{"bytes31", [31]byte{}, ""},
-		{"bytes31", [32]byte{}, "abi: cannot use [32]uint8 as type [31]uint8 as argument"},
-		{"bytes", []byte{0, 1}, ""},
-		{"bytes", [2]byte{0, 1}, ""},
-		{"bytes", common.Hash{1}, ""},
-		{"string", "hello world", ""},
-		{"bytes32[]", [][32]byte{{}}, ""},
-		{"function", [24]byte{}, ""},
-	} {
-		typ, err := NewType(test.typ)
-		if err != nil {
-			t.Fatal("unexpected parse error:", err)
-		}
-
-		err = typeCheck(typ, reflect.ValueOf(test.input))
-		if err != nil && len(test.err) == 0 {
-			t.Errorf("%d failed. Expected no err but got: %v", i, err)
-			continue
-		}
-		if err == nil && len(test.err) != 0 {
-			t.Errorf("%d failed. Expected err: %v but got none", i, test.err)
-			continue
-		}
-
-		if err != nil && len(test.err) != 0 && err.Error() != test.err {
-			t.Errorf("%d failed. Expected err: '%v' got err: '%v'", i, test.err, err)
-		}
-	}
-}
-
-func TestSimpleMethodUnpack(t *testing.T) {
-	for i, test := range []struct {
-		def              string      // definition of the **output** ABI params
-		marshalledOutput []byte      // evm return data
-		expectedOut      interface{} // the expected output
-		outVar           string      // the output variable (e.g. uint32, *big.Int, etc)
-		err              string      // empty or error if expected
-	}{
-		{
-			`[ { "type": "uint32" } ]`,
-			pad([]byte{1}, 32, true),
-			uint32(1),
-			"uint32",
-			"",
-		},
-		{
-			`[ { "type": "uint32" } ]`,
-			pad([]byte{1}, 32, true),
-			nil,
-			"uint16",
-			"abi: cannot unmarshal uint32 in to uint16",
-		},
-		{
-			`[ { "type": "uint17" } ]`,
-			pad([]byte{1}, 32, true),
-			nil,
-			"uint16",
-			"abi: cannot unmarshal *big.Int in to uint16",
-		},
-		{
-			`[ { "type": "uint17" } ]`,
-			pad([]byte{1}, 32, true),
-			big.NewInt(1),
-			"*big.Int",
-			"",
-		},
-
-		{
-			`[ { "type": "int32" } ]`,
-			pad([]byte{1}, 32, true),
-			int32(1),
-			"int32",
-			"",
-		},
-		{
-			`[ { "type": "int32" } ]`,
-			pad([]byte{1}, 32, true),
-			nil,
-			"int16",
-			"abi: cannot unmarshal int32 in to int16",
-		},
-		{
-			`[ { "type": "int17" } ]`,
-			pad([]byte{1}, 32, true),
-			nil,
-			"int16",
-			"abi: cannot unmarshal *big.Int in to int16",
-		},
-		{
-			`[ { "type": "int17" } ]`,
-			pad([]byte{1}, 32, true),
-			big.NewInt(1),
-			"*big.Int",
-			"",
-		},
-
-		{
-			`[ { "type": "address" } ]`,
-			pad(pad([]byte{1}, 20, false), 32, true),
-			common.Address{1},
-			"address",
-			"",
-		},
-		{
-			`[ { "type": "bytes32" } ]`,
-			pad([]byte{1}, 32, false),
-			pad([]byte{1}, 32, false),
-			"bytes",
-			"",
-		},
-		{
-			`[ { "type": "bytes32" } ]`,
-			pad([]byte{1}, 32, false),
-			pad([]byte{1}, 32, false),
-			"hash",
-			"",
-		},
-		{
-			`[ { "type": "bytes32" } ]`,
-			pad([]byte{1}, 32, false),
-			pad([]byte{1}, 32, false),
-			"interface",
-			"",
-		},
-		{
-			`[ { "type": "function" } ]`,
-			pad([]byte{1}, 32, false),
-			[24]byte{1},
-			"function",
-			"",
-		},
-	} {
-		abiDefinition := fmt.Sprintf(`[{ "name" : "method", "outputs": %s}]`, test.def)
-		abi, err := JSON(strings.NewReader(abiDefinition))
-		if err != nil {
-			t.Errorf("%d failed. %v", i, err)
-			continue
-		}
-
-		var outvar interface{}
-		switch test.outVar {
-		case "uint8":
-			var v uint8
-			err = abi.Unpack(&v, "method", test.marshalledOutput)
-			outvar = v
-		case "uint16":
-			var v uint16
-			err = abi.Unpack(&v, "method", test.marshalledOutput)
-			outvar = v
-		case "uint32":
-			var v uint32
-			err = abi.Unpack(&v, "method", test.marshalledOutput)
-			outvar = v
-		case "uint64":
-			var v uint64
-			err = abi.Unpack(&v, "method", test.marshalledOutput)
-			outvar = v
-		case "int8":
-			var v int8
-			err = abi.Unpack(&v, "method", test.marshalledOutput)
-			outvar = v
-		case "int16":
-			var v int16
-			err = abi.Unpack(&v, "method", test.marshalledOutput)
-			outvar = v
-		case "int32":
-			var v int32
-			err = abi.Unpack(&v, "method", test.marshalledOutput)
-			outvar = v
-		case "int64":
-			var v int64
-			err = abi.Unpack(&v, "method", test.marshalledOutput)
-			outvar = v
-		case "*big.Int":
-			var v *big.Int
-			err = abi.Unpack(&v, "method", test.marshalledOutput)
-			outvar = v
-		case "address":
-			var v common.Address
-			err = abi.Unpack(&v, "method", test.marshalledOutput)
-			outvar = v
-		case "bytes":
-			var v []byte
-			err = abi.Unpack(&v, "method", test.marshalledOutput)
-			outvar = v
-		case "hash":
-			var v common.Hash
-			err = abi.Unpack(&v, "method", test.marshalledOutput)
-			outvar = v
-		case "function":
-			var v [24]byte
-			err = abi.Unpack(&v, "method", test.marshalledOutput)
-			outvar = v
-		case "interface":
-			err = abi.Unpack(&outvar, "method", test.marshalledOutput)
-		default:
-			t.Errorf("unsupported type '%v' please add it to the switch statement in this test", test.outVar)
-			continue
-		}
-
-		if err != nil && len(test.err) == 0 {
-			t.Errorf("%d failed. Expected no err but got: %v", i, err)
-			continue
-		}
-		if err == nil && len(test.err) != 0 {
-			t.Errorf("%d failed. Expected err: %v but got none", i, test.err)
-			continue
-		}
-		if err != nil && len(test.err) != 0 && err.Error() != test.err {
-			t.Errorf("%d failed. Expected err: '%v' got err: '%v'", i, test.err, err)
-			continue
-		}
-
-		if err == nil {
-			// bit of an ugly hack for hash type but I don't feel like finding a proper solution
-			if test.outVar == "hash" {
-				tmp := outvar.(common.Hash) // without assignment it's unaddressable
-				outvar = tmp[:]
-			}
-
-			if !reflect.DeepEqual(test.expectedOut, outvar) {
-				t.Errorf("%d failed. Output error: expected %v, got %v", i, test.expectedOut, outvar)
-			}
-		}
-	}
-}
-
-func TestUnpackSetInterfaceSlice(t *testing.T) {
-	var (
-		var1 = new(uint8)
-		var2 = new(uint8)
-	)
-	out := []interface{}{var1, var2}
-	abi, err := JSON(strings.NewReader(`[{"type":"function", "name":"ints", "outputs":[{"type":"uint8"}, {"type":"uint8"}]}]`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	marshalledReturn := append(pad([]byte{1}, 32, true), pad([]byte{2}, 32, true)...)
-	err = abi.Unpack(&out, "ints", marshalledReturn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if *var1 != 1 {
-		t.Error("expected var1 to be 1, got", *var1)
-	}
-	if *var2 != 2 {
-		t.Error("expected var2 to be 2, got", *var2)
-	}
-
-	out = []interface{}{var1}
-	err = abi.Unpack(&out, "ints", marshalledReturn)
-
-	expErr := "abi: cannot marshal in to slices of unequal size (require: 2, got: 1)"
-	if err == nil || err.Error() != expErr {
-		t.Error("expected err:", expErr, "Got:", err)
-	}
-}
-
-func TestUnpackSetInterfaceArrayOutput(t *testing.T) {
-	var (
-		var1 = new([1]uint32)
-		var2 = new([1]uint32)
-	)
-	out := []interface{}{var1, var2}
-	abi, err := JSON(strings.NewReader(`[{"type":"function", "name":"ints", "outputs":[{"type":"uint32[1]"}, {"type":"uint32[1]"}]}]`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	marshalledReturn := append(pad([]byte{1}, 32, true), pad([]byte{2}, 32, true)...)
-	err = abi.Unpack(&out, "ints", marshalledReturn)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if *var1 != [1]uint32{1} {
-		t.Error("expected var1 to be [1], got", *var1)
-	}
-	if *var2 != [1]uint32{2} {
-		t.Error("expected var2 to be [2], got", *var2)
-	}
-}
-
-func TestPack(t *testing.T) {
-	for i, test := range []struct {
-		typ string
-
-		input  interface{}
-		output []byte
-	}{
-		{"uint16", uint16(2), pad([]byte{2}, 32, true)},
-		{"uint16[]", []uint16{1, 2}, formatSliceOutput([]byte{1}, []byte{2})},
-		{"bytes20", [20]byte{1}, pad([]byte{1}, 32, false)},
-		{"uint256[]", []*big.Int{big.NewInt(1), big.NewInt(2)}, formatSliceOutput([]byte{1}, []byte{2})},
-		{"address[]", []common.Address{{1}, {2}}, formatSliceOutput(pad([]byte{1}, 20, false), pad([]byte{2}, 20, false))},
-		{"bytes32[]", []common.Hash{{1}, {2}}, formatSliceOutput(pad([]byte{1}, 32, false), pad([]byte{2}, 32, false))},
-		{"function", [24]byte{1}, pad([]byte{1}, 32, false)},
-	} {
-		typ, err := NewType(test.typ)
-		if err != nil {
-			t.Fatal("unexpected parse error:", err)
-		}
-
-		output, err := typ.pack(reflect.ValueOf(test.input))
-		if err != nil {
-			t.Fatal("unexpected pack error:", err)
-		}
-
-		if !bytes.Equal(output, test.output) {
-			t.Errorf("%d failed. Expected bytes: '%x' Got: '%x'", i, test.output, output)
-		}
-	}
-}
-
-func TestMethodPack(t *testing.T) {
-	abi, err := JSON(strings.NewReader(jsondata2))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	sig := abi.Methods["slice"].Id()
-	sig = append(sig, common.LeftPadBytes([]byte{1}, 32)...)
-	sig = append(sig, common.LeftPadBytes([]byte{2}, 32)...)
-
-	packed, err := abi.Pack("slice", []uint32{1, 2})
-	if err != nil {
-		t.Error(err)
-	}
-
-	if !bytes.Equal(packed, sig) {
-		t.Errorf("expected %x got %x", sig, packed)
-	}
-
-	var addrA, addrB = common.Address{1}, common.Address{2}
-	sig = abi.Methods["sliceAddress"].Id()
-	sig = append(sig, common.LeftPadBytes([]byte{32}, 32)...)
-	sig = append(sig, common.LeftPadBytes([]byte{2}, 32)...)
-	sig = append(sig, common.LeftPadBytes(addrA[:], 32)...)
-	sig = append(sig, common.LeftPadBytes(addrB[:], 32)...)
-
-	packed, err = abi.Pack("sliceAddress", []common.Address{addrA, addrB})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(packed, sig) {
-		t.Errorf("expected %x got %x", sig, packed)
-	}
-
-	var addrC, addrD = common.Address{3}, common.Address{4}
-	sig = abi.Methods["sliceMultiAddress"].Id()
-	sig = append(sig, common.LeftPadBytes([]byte{64}, 32)...)
-	sig = append(sig, common.LeftPadBytes([]byte{160}, 32)...)
-	sig = append(sig, common.LeftPadBytes([]byte{2}, 32)...)
-	sig = append(sig, common.LeftPadBytes(addrA[:], 32)...)
-	sig = append(sig, common.LeftPadBytes(addrB[:], 32)...)
-	sig = append(sig, common.LeftPadBytes([]byte{2}, 32)...)
-	sig = append(sig, common.LeftPadBytes(addrC[:], 32)...)
-	sig = append(sig, common.LeftPadBytes(addrD[:], 32)...)
-
-	packed, err = abi.Pack("sliceMultiAddress", []common.Address{addrA, addrB}, []common.Address{addrC, addrD})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(packed, sig) {
-		t.Errorf("expected %x got %x", sig, packed)
-	}
-
-	sig = abi.Methods["slice256"].Id()
-	sig = append(sig, common.LeftPadBytes([]byte{1}, 32)...)
-	sig = append(sig, common.LeftPadBytes([]byte{2}, 32)...)
-
-	packed, err = abi.Pack("slice256", []*big.Int{big.NewInt(1), big.NewInt(2)})
-	if err != nil {
-		t.Error(err)
-	}
-
-	if !bytes.Equal(packed, sig) {
-		t.Errorf("expected %x got %x", sig, packed)
-	}
-}
 
 const jsondata = `
 [
@@ -475,18 +50,21 @@ const jsondata2 = `
 	{ "type" : "function", "name" : "slice", "constant" : false, "inputs" : [ { "name" : "inputs", "type" : "uint32[2]" } ] },
 	{ "type" : "function", "name" : "slice256", "constant" : false, "inputs" : [ { "name" : "inputs", "type" : "uint256[2]" } ] },
 	{ "type" : "function", "name" : "sliceAddress", "constant" : false, "inputs" : [ { "name" : "inputs", "type" : "address[]" } ] },
-	{ "type" : "function", "name" : "sliceMultiAddress", "constant" : false, "inputs" : [ { "name" : "a", "type" : "address[]" }, { "name" : "b", "type" : "address[]" } ] }
+	{ "type" : "function", "name" : "sliceMultiAddress", "constant" : false, "inputs" : [ { "name" : "a", "type" : "address[]" }, { "name" : "b", "type" : "address[]" } ] },
+	{ "type" : "function", "name" : "nestedArray", "constant" : false, "inputs" : [ { "name" : "a", "type" : "uint256[2][2]" }, { "name" : "b", "type" : "address[]" } ] },
+	{ "type" : "function", "name" : "nestedArray2", "constant" : false, "inputs" : [ { "name" : "a", "type" : "uint8[][2]" } ] },
+	{ "type" : "function", "name" : "nestedSlice", "constant" : false, "inputs" : [ { "name" : "a", "type" : "uint8[][]" } ] }
 ]`
 
 func TestReader(t *testing.T) {
-	Uint256, _ := NewType("uint256")
+	Uint256, _ := NewType("uint256", nil)
 	exp := ABI{
 		Methods: map[string]Method{
 			"balance": {
-				"balance", true, nil, nil,
+				"balance", "balance", true, nil, nil,
 			},
 			"send": {
-				"send", false, []Argument{
+				"send", "send", false, []Argument{
 					{"amount", Uint256, false},
 				}, nil,
 			},
@@ -499,17 +77,31 @@ func TestReader(t *testing.T) {
 	}
 
 	// deep equal fails for some reason
-	t.Skip()
-	if !reflect.DeepEqual(abi, exp) {
-		t.Errorf("\nabi: %v\ndoes not match exp: %v", abi, exp)
+	for name, expM := range exp.Methods {
+		gotM, exist := abi.Methods[name]
+		if !exist {
+			t.Errorf("Missing expected method %v", name)
+		}
+		if !reflect.DeepEqual(gotM, expM) {
+			t.Errorf("\nGot abi method: \n%v\ndoes not match expected method\n%v", gotM, expM)
+		}
+	}
+
+	for name, gotM := range abi.Methods {
+		expM, exist := exp.Methods[name]
+		if !exist {
+			t.Errorf("Found extra method %v", name)
+		}
+		if !reflect.DeepEqual(gotM, expM) {
+			t.Errorf("\nGot abi method: \n%v\ndoes not match expected method\n%v", gotM, expM)
+		}
 	}
 }
 
 func TestTestNumbers(t *testing.T) {
 	abi, err := JSON(strings.NewReader(jsondata2))
 	if err != nil {
-		t.Error(err)
-		t.FailNow()
+		t.Fatal(err)
 	}
 
 	if _, err := abi.Pack("balance"); err != nil {
@@ -546,8 +138,7 @@ func TestTestNumbers(t *testing.T) {
 func TestTestString(t *testing.T) {
 	abi, err := JSON(strings.NewReader(jsondata2))
 	if err != nil {
-		t.Error(err)
-		t.FailNow()
+		t.Fatal(err)
 	}
 
 	if _, err := abi.Pack("string", "hello world"); err != nil {
@@ -558,8 +149,7 @@ func TestTestString(t *testing.T) {
 func TestTestBool(t *testing.T) {
 	abi, err := JSON(strings.NewReader(jsondata2))
 	if err != nil {
-		t.Error(err)
-		t.FailNow()
+		t.Fatal(err)
 	}
 
 	if _, err := abi.Pack("bool", true); err != nil {
@@ -570,46 +160,84 @@ func TestTestBool(t *testing.T) {
 func TestTestSlice(t *testing.T) {
 	abi, err := JSON(strings.NewReader(jsondata2))
 	if err != nil {
-		t.Error(err)
-		t.FailNow()
+		t.Fatal(err)
 	}
-
 	slice := make([]uint64, 2)
 	if _, err := abi.Pack("uint64[2]", slice); err != nil {
 		t.Error(err)
 	}
-
 	if _, err := abi.Pack("uint64[]", slice); err != nil {
 		t.Error(err)
 	}
 }
 
 func TestMethodSignature(t *testing.T) {
-	String, _ := NewType("string")
-	m := Method{"foo", false, []Argument{{"bar", String, false}, {"baz", String, false}}, nil}
+	String, _ := NewType("string", nil)
+	m := Method{"foo", "foo", false, []Argument{{"bar", String, false}, {"baz", String, false}}, nil}
 	exp := "foo(string,string)"
 	if m.Sig() != exp {
 		t.Error("signature mismatch", exp, "!=", m.Sig())
 	}
 
 	idexp := crypto.Keccak256([]byte(exp))[:4]
-	if !bytes.Equal(m.Id(), idexp) {
-		t.Errorf("expected ids to match %x != %x", m.Id(), idexp)
+	if !bytes.Equal(m.ID(), idexp) {
+		t.Errorf("expected ids to match %x != %x", m.ID(), idexp)
 	}
 
-	uintt, _ := NewType("uint")
-	m = Method{"foo", false, []Argument{{"bar", uintt, false}}, nil}
+	uintt, _ := NewType("uint256", nil)
+	m = Method{"foo", "foo", false, []Argument{{"bar", uintt, false}}, nil}
 	exp = "foo(uint256)"
+	if m.Sig() != exp {
+		t.Error("signature mismatch", exp, "!=", m.Sig())
+	}
+
+	// Method with tuple arguments
+	s, _ := NewType("tuple", []ArgumentMarshaling{
+		{Name: "a", Type: "int256"},
+		{Name: "b", Type: "int256[]"},
+		{Name: "c", Type: "tuple[]", Components: []ArgumentMarshaling{
+			{Name: "x", Type: "int256"},
+			{Name: "y", Type: "int256"},
+		}},
+		{Name: "d", Type: "tuple[2]", Components: []ArgumentMarshaling{
+			{Name: "x", Type: "int256"},
+			{Name: "y", Type: "int256"},
+		}},
+	})
+	m = Method{"foo", "foo", false, []Argument{{"s", s, false}, {"bar", String, false}}, nil}
+	exp = "foo((int256,int256[],(int256,int256)[],(int256,int256)[2]),string)"
 	if m.Sig() != exp {
 		t.Error("signature mismatch", exp, "!=", m.Sig())
 	}
 }
 
+func TestOverloadedMethodSignature(t *testing.T) {
+	json := `[{"constant":true,"inputs":[{"name":"i","type":"uint256"},{"name":"j","type":"uint256"}],"name":"foo","outputs":[],"payable":false,"stateMutability":"pure","type":"function"},{"constant":true,"inputs":[{"name":"i","type":"uint256"}],"name":"foo","outputs":[],"payable":false,"stateMutability":"pure","type":"function"},{"anonymous":false,"inputs":[{"indexed":false,"name":"i","type":"uint256"}],"name":"bar","type":"event"},{"anonymous":false,"inputs":[{"indexed":false,"name":"i","type":"uint256"},{"indexed":false,"name":"j","type":"uint256"}],"name":"bar","type":"event"}]`
+	abi, err := JSON(strings.NewReader(json))
+	if err != nil {
+		t.Fatal(err)
+	}
+	check := func(name string, expect string, method bool) {
+		if method {
+			if abi.Methods[name].Sig() != expect {
+				t.Fatalf("The signature of overloaded method mismatch, want %s, have %s", expect, abi.Methods[name].Sig())
+			}
+		} else {
+			if abi.Events[name].Sig() != expect {
+				t.Fatalf("The signature of overloaded event mismatch, want %s, have %s", expect, abi.Events[name].Sig())
+			}
+		}
+	}
+	check("foo", "foo(uint256,uint256)", true)
+	check("foo0", "foo(uint256)", true)
+	check("bar", "bar(uint256)", false)
+	check("bar0", "bar(uint256,uint256)", false)
+}
+
 func TestMultiPack(t *testing.T) {
 	abi, err := JSON(strings.NewReader(jsondata2))
 	if err != nil {
-		t.Error(err)
-		t.FailNow()
+		t.Fatal(err)
 	}
 
 	sig := crypto.Keccak256([]byte("bar(uint32,uint16)"))[:4]
@@ -619,10 +247,8 @@ func TestMultiPack(t *testing.T) {
 
 	packed, err := abi.Pack("bar", uint32(10), uint16(11))
 	if err != nil {
-		t.Error(err)
-		t.FailNow()
+		t.Fatal(err)
 	}
-
 	if !bytes.Equal(packed, sig) {
 		t.Errorf("expected %x got %x", sig, packed)
 	}
@@ -633,11 +259,11 @@ func ExampleJSON() {
 
 	abi, err := JSON(strings.NewReader(definition))
 	if err != nil {
-		log.Fatalln(err)
+		panic(err)
 	}
 	out, err := abi.Pack("isBar", common.HexToAddress("01"))
 	if err != nil {
-		log.Fatalln(err)
+		panic(err)
 	}
 
 	fmt.Printf("%x\n", out)
@@ -773,6 +399,188 @@ func TestInputVariableInputLength(t *testing.T) {
 	}
 }
 
+func TestInputFixedArrayAndVariableInputLength(t *testing.T) {
+	const definition = `[
+	{ "type" : "function", "name" : "fixedArrStr", "constant" : true, "inputs" : [ { "name" : "str", "type" : "string" }, { "name" : "fixedArr", "type" : "uint256[2]" } ] },
+	{ "type" : "function", "name" : "fixedArrBytes", "constant" : true, "inputs" : [ { "name" : "str", "type" : "bytes" }, { "name" : "fixedArr", "type" : "uint256[2]" } ] },
+    { "type" : "function", "name" : "mixedArrStr", "constant" : true, "inputs" : [ { "name" : "str", "type" : "string" }, { "name" : "fixedArr", "type": "uint256[2]" }, { "name" : "dynArr", "type": "uint256[]" } ] },
+    { "type" : "function", "name" : "doubleFixedArrStr", "constant" : true, "inputs" : [ { "name" : "str", "type" : "string" }, { "name" : "fixedArr1", "type": "uint256[2]" }, { "name" : "fixedArr2", "type": "uint256[3]" } ] },
+    { "type" : "function", "name" : "multipleMixedArrStr", "constant" : true, "inputs" : [ { "name" : "str", "type" : "string" }, { "name" : "fixedArr1", "type": "uint256[2]" }, { "name" : "dynArr", "type" : "uint256[]" }, { "name" : "fixedArr2", "type" : "uint256[3]" } ] }
+	]`
+
+	abi, err := JSON(strings.NewReader(definition))
+	if err != nil {
+		t.Error(err)
+	}
+
+	// test string, fixed array uint256[2]
+	strin := "hello world"
+	arrin := [2]*big.Int{big.NewInt(1), big.NewInt(2)}
+	fixedArrStrPack, err := abi.Pack("fixedArrStr", strin, arrin)
+	if err != nil {
+		t.Error(err)
+	}
+
+	// generate expected output
+	offset := make([]byte, 32)
+	offset[31] = 96
+	length := make([]byte, 32)
+	length[31] = byte(len(strin))
+	strvalue := common.RightPadBytes([]byte(strin), 32)
+	arrinvalue1 := common.LeftPadBytes(arrin[0].Bytes(), 32)
+	arrinvalue2 := common.LeftPadBytes(arrin[1].Bytes(), 32)
+	exp := append(offset, arrinvalue1...)
+	exp = append(exp, arrinvalue2...)
+	exp = append(exp, append(length, strvalue...)...)
+
+	// ignore first 4 bytes of the output. This is the function identifier
+	fixedArrStrPack = fixedArrStrPack[4:]
+	if !bytes.Equal(fixedArrStrPack, exp) {
+		t.Errorf("expected %x, got %x\n", exp, fixedArrStrPack)
+	}
+
+	// test byte array, fixed array uint256[2]
+	bytesin := []byte(strin)
+	arrin = [2]*big.Int{big.NewInt(1), big.NewInt(2)}
+	fixedArrBytesPack, err := abi.Pack("fixedArrBytes", bytesin, arrin)
+	if err != nil {
+		t.Error(err)
+	}
+
+	// generate expected output
+	offset = make([]byte, 32)
+	offset[31] = 96
+	length = make([]byte, 32)
+	length[31] = byte(len(strin))
+	strvalue = common.RightPadBytes([]byte(strin), 32)
+	arrinvalue1 = common.LeftPadBytes(arrin[0].Bytes(), 32)
+	arrinvalue2 = common.LeftPadBytes(arrin[1].Bytes(), 32)
+	exp = append(offset, arrinvalue1...)
+	exp = append(exp, arrinvalue2...)
+	exp = append(exp, append(length, strvalue...)...)
+
+	// ignore first 4 bytes of the output. This is the function identifier
+	fixedArrBytesPack = fixedArrBytesPack[4:]
+	if !bytes.Equal(fixedArrBytesPack, exp) {
+		t.Errorf("expected %x, got %x\n", exp, fixedArrBytesPack)
+	}
+
+	// test string, fixed array uint256[2], dynamic array uint256[]
+	strin = "hello world"
+	fixedarrin := [2]*big.Int{big.NewInt(1), big.NewInt(2)}
+	dynarrin := []*big.Int{big.NewInt(1), big.NewInt(2), big.NewInt(3)}
+	mixedArrStrPack, err := abi.Pack("mixedArrStr", strin, fixedarrin, dynarrin)
+	if err != nil {
+		t.Error(err)
+	}
+
+	// generate expected output
+	stroffset := make([]byte, 32)
+	stroffset[31] = 128
+	strlength := make([]byte, 32)
+	strlength[31] = byte(len(strin))
+	strvalue = common.RightPadBytes([]byte(strin), 32)
+	fixedarrinvalue1 := common.LeftPadBytes(fixedarrin[0].Bytes(), 32)
+	fixedarrinvalue2 := common.LeftPadBytes(fixedarrin[1].Bytes(), 32)
+	dynarroffset := make([]byte, 32)
+	dynarroffset[31] = byte(160 + ((len(strin)/32)+1)*32)
+	dynarrlength := make([]byte, 32)
+	dynarrlength[31] = byte(len(dynarrin))
+	dynarrinvalue1 := common.LeftPadBytes(dynarrin[0].Bytes(), 32)
+	dynarrinvalue2 := common.LeftPadBytes(dynarrin[1].Bytes(), 32)
+	dynarrinvalue3 := common.LeftPadBytes(dynarrin[2].Bytes(), 32)
+	exp = append(stroffset, fixedarrinvalue1...)
+	exp = append(exp, fixedarrinvalue2...)
+	exp = append(exp, dynarroffset...)
+	exp = append(exp, append(strlength, strvalue...)...)
+	dynarrarg := append(dynarrlength, dynarrinvalue1...)
+	dynarrarg = append(dynarrarg, dynarrinvalue2...)
+	dynarrarg = append(dynarrarg, dynarrinvalue3...)
+	exp = append(exp, dynarrarg...)
+
+	// ignore first 4 bytes of the output. This is the function identifier
+	mixedArrStrPack = mixedArrStrPack[4:]
+	if !bytes.Equal(mixedArrStrPack, exp) {
+		t.Errorf("expected %x, got %x\n", exp, mixedArrStrPack)
+	}
+
+	// test string, fixed array uint256[2], fixed array uint256[3]
+	strin = "hello world"
+	fixedarrin1 := [2]*big.Int{big.NewInt(1), big.NewInt(2)}
+	fixedarrin2 := [3]*big.Int{big.NewInt(1), big.NewInt(2), big.NewInt(3)}
+	doubleFixedArrStrPack, err := abi.Pack("doubleFixedArrStr", strin, fixedarrin1, fixedarrin2)
+	if err != nil {
+		t.Error(err)
+	}
+
+	// generate expected output
+	stroffset = make([]byte, 32)
+	stroffset[31] = 192
+	strlength = make([]byte, 32)
+	strlength[31] = byte(len(strin))
+	strvalue = common.RightPadBytes([]byte(strin), 32)
+	fixedarrin1value1 := common.LeftPadBytes(fixedarrin1[0].Bytes(), 32)
+	fixedarrin1value2 := common.LeftPadBytes(fixedarrin1[1].Bytes(), 32)
+	fixedarrin2value1 := common.LeftPadBytes(fixedarrin2[0].Bytes(), 32)
+	fixedarrin2value2 := common.LeftPadBytes(fixedarrin2[1].Bytes(), 32)
+	fixedarrin2value3 := common.LeftPadBytes(fixedarrin2[2].Bytes(), 32)
+	exp = append(stroffset, fixedarrin1value1...)
+	exp = append(exp, fixedarrin1value2...)
+	exp = append(exp, fixedarrin2value1...)
+	exp = append(exp, fixedarrin2value2...)
+	exp = append(exp, fixedarrin2value3...)
+	exp = append(exp, append(strlength, strvalue...)...)
+
+	// ignore first 4 bytes of the output. This is the function identifier
+	doubleFixedArrStrPack = doubleFixedArrStrPack[4:]
+	if !bytes.Equal(doubleFixedArrStrPack, exp) {
+		t.Errorf("expected %x, got %x\n", exp, doubleFixedArrStrPack)
+	}
+
+	// test string, fixed array uint256[2], dynamic array uint256[], fixed array uint256[3]
+	strin = "hello world"
+	fixedarrin1 = [2]*big.Int{big.NewInt(1), big.NewInt(2)}
+	dynarrin = []*big.Int{big.NewInt(1), big.NewInt(2)}
+	fixedarrin2 = [3]*big.Int{big.NewInt(1), big.NewInt(2), big.NewInt(3)}
+	multipleMixedArrStrPack, err := abi.Pack("multipleMixedArrStr", strin, fixedarrin1, dynarrin, fixedarrin2)
+	if err != nil {
+		t.Error(err)
+	}
+
+	// generate expected output
+	stroffset = make([]byte, 32)
+	stroffset[31] = 224
+	strlength = make([]byte, 32)
+	strlength[31] = byte(len(strin))
+	strvalue = common.RightPadBytes([]byte(strin), 32)
+	fixedarrin1value1 = common.LeftPadBytes(fixedarrin1[0].Bytes(), 32)
+	fixedarrin1value2 = common.LeftPadBytes(fixedarrin1[1].Bytes(), 32)
+	dynarroffset = U256(big.NewInt(int64(256 + ((len(strin)/32)+1)*32)))
+	dynarrlength = make([]byte, 32)
+	dynarrlength[31] = byte(len(dynarrin))
+	dynarrinvalue1 = common.LeftPadBytes(dynarrin[0].Bytes(), 32)
+	dynarrinvalue2 = common.LeftPadBytes(dynarrin[1].Bytes(), 32)
+	fixedarrin2value1 = common.LeftPadBytes(fixedarrin2[0].Bytes(), 32)
+	fixedarrin2value2 = common.LeftPadBytes(fixedarrin2[1].Bytes(), 32)
+	fixedarrin2value3 = common.LeftPadBytes(fixedarrin2[2].Bytes(), 32)
+	exp = append(stroffset, fixedarrin1value1...)
+	exp = append(exp, fixedarrin1value2...)
+	exp = append(exp, dynarroffset...)
+	exp = append(exp, fixedarrin2value1...)
+	exp = append(exp, fixedarrin2value2...)
+	exp = append(exp, fixedarrin2value3...)
+	exp = append(exp, append(strlength, strvalue...)...)
+	dynarrarg = append(dynarrlength, dynarrinvalue1...)
+	dynarrarg = append(dynarrarg, dynarrinvalue2...)
+	exp = append(exp, dynarrarg...)
+
+	// ignore first 4 bytes of the output. This is the function identifier
+	multipleMixedArrStrPack = multipleMixedArrStrPack[4:]
+	if !bytes.Equal(multipleMixedArrStrPack, exp) {
+		t.Errorf("expected %x, got %x\n", exp, multipleMixedArrStrPack)
+	}
+}
+
 func TestDefaultFunctionParsing(t *testing.T) {
 	const definition = `[{ "name" : "balance" }]`
 
@@ -790,11 +598,13 @@ func TestBareEvents(t *testing.T) {
 	const definition = `[
 	{ "type" : "event", "name" : "balance" },
 	{ "type" : "event", "name" : "anon", "anonymous" : true},
-	{ "type" : "event", "name" : "args", "inputs" : [{ "indexed":false, "name":"arg0", "type":"uint256" }, { "indexed":true, "name":"arg1", "type":"address" }] }
+	{ "type" : "event", "name" : "args", "inputs" : [{ "indexed":false, "name":"arg0", "type":"uint256" }, { "indexed":true, "name":"arg1", "type":"address" }] },
+	{ "type" : "event", "name" : "tuple", "inputs" : [{ "indexed":false, "name":"t", "type":"tuple", "components":[{"name":"a", "type":"uint256"}] }, { "indexed":true, "name":"arg1", "type":"address" }] }
 	]`
 
-	arg0, _ := NewType("uint256")
-	arg1, _ := NewType("address")
+	arg0, _ := NewType("uint256", nil)
+	arg1, _ := NewType("address", nil)
+	tuple, _ := NewType("tuple", []ArgumentMarshaling{{Name: "a", Type: "uint256"}})
 
 	expectedEvents := map[string]struct {
 		Anonymous bool
@@ -804,6 +614,10 @@ func TestBareEvents(t *testing.T) {
 		"anon":    {true, nil},
 		"args": {false, []Argument{
 			{Name: "arg0", Type: arg0, Indexed: false},
+			{Name: "arg1", Type: arg1, Indexed: true},
+		}},
+		"tuple": {false, []Argument{
+			{Name: "t", Type: tuple, Indexed: false},
 			{Name: "arg1", Type: arg1, Indexed: true},
 		}},
 	}
@@ -844,398 +658,396 @@ func TestBareEvents(t *testing.T) {
 	}
 }
 
-func TestMultiReturnWithStruct(t *testing.T) {
-	const definition = `[
-	{ "name" : "multi", "constant" : false, "outputs": [ { "name": "Int", "type": "uint256" }, { "name": "String", "type": "string" } ] }]`
-
-	abi, err := JSON(strings.NewReader(definition))
+// TestUnpackEvent is based on this contract:
+//    contract T {
+//      event received(address sender, uint amount, bytes memo);
+//      event receivedAddr(address sender);
+//      function receive(bytes memo) external payable {
+//        received(msg.sender, msg.value, memo);
+//        receivedAddr(msg.sender);
+//      }
+//    }
+// When receive("X") is called with sender 0x00... and value 1, it produces this tx receipt:
+//   receipt{status=1 cgas=23949 bloom=00000000004000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000040200000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000080000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 logs=[log: b6818c8064f645cd82d99b59a1a267d6d61117ef [75fd880d39c1daf53b6547ab6cb59451fc6452d27caa90e5b6649dd8293b9eed] 000000000000000000000000376c47978271565f56deb45495afa69e59c16ab200000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000060000000000000000000000000000000000000000000000000000000000000000158 9ae378b6d4409eada347a5dc0c180f186cb62dc68fcc0f043425eb917335aa28 0 95d429d309bb9d753954195fe2d69bd140b4ae731b9b5b605c34323de162cf00 0]}
+func TestUnpackEvent(t *testing.T) {
+	const abiJSON = `[{"constant":false,"inputs":[{"name":"memo","type":"bytes"}],"name":"receive","outputs":[],"payable":true,"stateMutability":"payable","type":"function"},{"anonymous":false,"inputs":[{"indexed":false,"name":"sender","type":"address"},{"indexed":false,"name":"amount","type":"uint256"},{"indexed":false,"name":"memo","type":"bytes"}],"name":"received","type":"event"},{"anonymous":false,"inputs":[{"indexed":false,"name":"sender","type":"address"}],"name":"receivedAddr","type":"event"}]`
+	abi, err := JSON(strings.NewReader(abiJSON))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// using buff to make the code readable
-	buff := new(bytes.Buffer)
-	buff.Write(common.Hex2Bytes("0000000000000000000000000000000000000000000000000000000000000001"))
-	buff.Write(common.Hex2Bytes("0000000000000000000000000000000000000000000000000000000000000040"))
-	buff.Write(common.Hex2Bytes("0000000000000000000000000000000000000000000000000000000000000005"))
-	stringOut := "hello"
-	buff.Write(common.RightPadBytes([]byte(stringOut), 32))
-
-	var inter struct {
-		Int    *big.Int
-		String string
+	const hexdata = `000000000000000000000000376c47978271565f56deb45495afa69e59c16ab200000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000060000000000000000000000000000000000000000000000000000000000000000158`
+	data, err := hex.DecodeString(hexdata)
+	if err != nil {
+		t.Fatal(err)
 	}
-	err = abi.Unpack(&inter, "multi", buff.Bytes())
+	if len(data)%32 == 0 {
+		t.Errorf("len(data) is %d, want a non-multiple of 32", len(data))
+	}
+
+	type ReceivedEvent struct {
+		Sender common.Address
+		Amount *big.Int
+		Memo   []byte
+	}
+	var ev ReceivedEvent
+
+	err = abi.Unpack(&ev, "received", data)
 	if err != nil {
 		t.Error(err)
 	}
 
-	if inter.Int == nil || inter.Int.Cmp(big.NewInt(1)) != 0 {
-		t.Error("expected Int to be 1 got", inter.Int)
+	type ReceivedAddrEvent struct {
+		Sender common.Address
 	}
-
-	if inter.String != stringOut {
-		t.Error("expected String to be", stringOut, "got", inter.String)
-	}
-
-	var reversed struct {
-		String string
-		Int    *big.Int
-	}
-
-	err = abi.Unpack(&reversed, "multi", buff.Bytes())
+	var receivedAddrEv ReceivedAddrEvent
+	err = abi.Unpack(&receivedAddrEv, "receivedAddr", data)
 	if err != nil {
 		t.Error(err)
-	}
-
-	if reversed.Int == nil || reversed.Int.Cmp(big.NewInt(1)) != 0 {
-		t.Error("expected Int to be 1 got", reversed.Int)
-	}
-
-	if reversed.String != stringOut {
-		t.Error("expected String to be", stringOut, "got", reversed.String)
 	}
 }
 
-func TestMultiReturnWithSlice(t *testing.T) {
-	const definition = `[
-	{ "name" : "multi", "constant" : false, "outputs": [ { "name": "Int", "type": "uint256" }, { "name": "String", "type": "string" } ] }]`
-
-	abi, err := JSON(strings.NewReader(definition))
+func TestUnpackEventIntoMap(t *testing.T) {
+	const abiJSON = `[{"constant":false,"inputs":[{"name":"memo","type":"bytes"}],"name":"receive","outputs":[],"payable":true,"stateMutability":"payable","type":"function"},{"anonymous":false,"inputs":[{"indexed":false,"name":"sender","type":"address"},{"indexed":false,"name":"amount","type":"uint256"},{"indexed":false,"name":"memo","type":"bytes"}],"name":"received","type":"event"},{"anonymous":false,"inputs":[{"indexed":false,"name":"sender","type":"address"}],"name":"receivedAddr","type":"event"}]`
+	abi, err := JSON(strings.NewReader(abiJSON))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// using buff to make the code readable
-	buff := new(bytes.Buffer)
-	buff.Write(common.Hex2Bytes("0000000000000000000000000000000000000000000000000000000000000001"))
-	buff.Write(common.Hex2Bytes("0000000000000000000000000000000000000000000000000000000000000040"))
-	buff.Write(common.Hex2Bytes("0000000000000000000000000000000000000000000000000000000000000005"))
-	stringOut := "hello"
-	buff.Write(common.RightPadBytes([]byte(stringOut), 32))
-
-	var inter []interface{}
-	err = abi.Unpack(&inter, "multi", buff.Bytes())
+	const hexdata = `000000000000000000000000376c47978271565f56deb45495afa69e59c16ab200000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000060000000000000000000000000000000000000000000000000000000000000000158`
+	data, err := hex.DecodeString(hexdata)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data)%32 == 0 {
+		t.Errorf("len(data) is %d, want a non-multiple of 32", len(data))
+	}
+
+	receivedMap := map[string]interface{}{}
+	expectedReceivedMap := map[string]interface{}{
+		"sender": common.HexToAddress("0x376c47978271565f56DEB45495afa69E59c16Ab2"),
+		"amount": big.NewInt(1),
+		"memo":   []byte{88},
+	}
+	if err := abi.UnpackIntoMap(receivedMap, "received", data); err != nil {
 		t.Error(err)
 	}
-
-	if len(inter) != 2 {
-		t.Fatal("expected 2 results got", len(inter))
+	if len(receivedMap) != 3 {
+		t.Error("unpacked `received` map expected to have length 3")
+	}
+	if receivedMap["sender"] != expectedReceivedMap["sender"] {
+		t.Error("unpacked `received` map does not match expected map")
+	}
+	if receivedMap["amount"].(*big.Int).Cmp(expectedReceivedMap["amount"].(*big.Int)) != 0 {
+		t.Error("unpacked `received` map does not match expected map")
+	}
+	if !bytes.Equal(receivedMap["memo"].([]byte), expectedReceivedMap["memo"].([]byte)) {
+		t.Error("unpacked `received` map does not match expected map")
 	}
 
-	if num, ok := inter[0].(*big.Int); !ok || num.Cmp(big.NewInt(1)) != 0 {
-		t.Error("expected index 0 to be 1 got", num)
+	receivedAddrMap := map[string]interface{}{}
+	if err = abi.UnpackIntoMap(receivedAddrMap, "receivedAddr", data); err != nil {
+		t.Error(err)
 	}
-
-	if str, ok := inter[1].(string); !ok || str != stringOut {
-		t.Error("expected index 1 to be", stringOut, "got", str)
+	if len(receivedAddrMap) != 1 {
+		t.Error("unpacked `receivedAddr` map expected to have length 1")
+	}
+	if receivedAddrMap["sender"] != expectedReceivedMap["sender"] {
+		t.Error("unpacked `receivedAddr` map does not match expected map")
 	}
 }
 
-func TestMarshalArrays(t *testing.T) {
-	const definition = `[
-	{ "name" : "bytes32", "constant" : false, "outputs": [ { "type": "bytes32" } ] },
-	{ "name" : "bytes10", "constant" : false, "outputs": [ { "type": "bytes10" } ] }
-	]`
-
-	abi, err := JSON(strings.NewReader(definition))
+func TestUnpackMethodIntoMap(t *testing.T) {
+	const abiJSON = `[{"constant":false,"inputs":[{"name":"memo","type":"bytes"}],"name":"receive","outputs":[],"payable":true,"stateMutability":"payable","type":"function"},{"constant":false,"inputs":[],"name":"send","outputs":[{"name":"amount","type":"uint256"}],"payable":true,"stateMutability":"payable","type":"function"},{"constant":false,"inputs":[{"name":"addr","type":"address"}],"name":"get","outputs":[{"name":"hash","type":"bytes"}],"payable":true,"stateMutability":"payable","type":"function"}]`
+	abi, err := JSON(strings.NewReader(abiJSON))
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	output := common.LeftPadBytes([]byte{1}, 32)
-
-	var bytes10 [10]byte
-	err = abi.Unpack(&bytes10, "bytes32", output)
-	if err == nil || err.Error() != "abi: cannot unmarshal src (len=32) in to dst (len=10)" {
-		t.Error("expected error or bytes32 not be assignable to bytes10:", err)
-	}
-
-	var bytes32 [32]byte
-	err = abi.Unpack(&bytes32, "bytes32", output)
+	const hexdata = `00000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000060000000000000000000000000000000000000000000000000000000000000015800000000000000000000000000000000000000000000000000000000000000600000000000000000000000000000000000000000000000000000000000000158000000000000000000000000000000000000000000000000000000000000006000000000000000000000000000000000000000000000000000000000000001580000000000000000000000000000000000000000000000000000000000000060000000000000000000000000000000000000000000000000000000000000015800000000000000000000000000000000000000000000000000000000000000600000000000000000000000000000000000000000000000000000000000000158`
+	data, err := hex.DecodeString(hexdata)
 	if err != nil {
-		t.Error("didn't expect error:", err)
+		t.Fatal(err)
 	}
-	if !bytes.Equal(bytes32[:], output) {
-		t.Error("expected bytes32[31] to be 1 got", bytes32[31])
-	}
-
-	type (
-		B10 [10]byte
-		B32 [32]byte
-	)
-
-	var b10 B10
-	err = abi.Unpack(&b10, "bytes32", output)
-	if err == nil || err.Error() != "abi: cannot unmarshal src (len=32) in to dst (len=10)" {
-		t.Error("expected error or bytes32 not be assignable to bytes10:", err)
+	if len(data)%32 != 0 {
+		t.Errorf("len(data) is %d, want a multiple of 32", len(data))
 	}
 
-	var b32 B32
-	err = abi.Unpack(&b32, "bytes32", output)
-	if err != nil {
-		t.Error("didn't expect error:", err)
+	// Tests a method with no outputs
+	receiveMap := map[string]interface{}{}
+	if err = abi.UnpackIntoMap(receiveMap, "receive", data); err != nil {
+		t.Error(err)
 	}
-	if !bytes.Equal(b32[:], output) {
-		t.Error("expected bytes32[31] to be 1 got", bytes32[31])
+	if len(receiveMap) > 0 {
+		t.Error("unpacked `receive` map expected to have length 0")
 	}
 
-	output[10] = 1
-	var shortAssignLong [32]byte
-	err = abi.Unpack(&shortAssignLong, "bytes10", output)
-	if err != nil {
-		t.Error("didn't expect error:", err)
+	// Tests a method with only outputs
+	sendMap := map[string]interface{}{}
+	if err = abi.UnpackIntoMap(sendMap, "send", data); err != nil {
+		t.Error(err)
 	}
-	if !bytes.Equal(output, shortAssignLong[:]) {
-		t.Errorf("expected %x to be %x", shortAssignLong, output)
+	if len(sendMap) != 1 {
+		t.Error("unpacked `send` map expected to have length 1")
+	}
+	if sendMap["amount"].(*big.Int).Cmp(big.NewInt(1)) != 0 {
+		t.Error("unpacked `send` map expected `amount` value of 1")
+	}
+
+	// Tests a method with outputs and inputs
+	getMap := map[string]interface{}{}
+	if err = abi.UnpackIntoMap(getMap, "get", data); err != nil {
+		t.Error(err)
+	}
+	if len(getMap) != 1 {
+		t.Error("unpacked `get` map expected to have length 1")
+	}
+	expectedBytes := []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 96, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 88, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 96, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 88, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 96, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 88, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 96, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 88, 0}
+	if !bytes.Equal(getMap["hash"].([]byte), expectedBytes) {
+		t.Errorf("unpacked `get` map expected `hash` value of %v", expectedBytes)
 	}
 }
 
-func TestUnmarshal(t *testing.T) {
-	const definition = `[
-	{ "name" : "int", "constant" : false, "outputs": [ { "type": "uint256" } ] },
-	{ "name" : "bool", "constant" : false, "outputs": [ { "type": "bool" } ] },
-	{ "name" : "bytes", "constant" : false, "outputs": [ { "type": "bytes" } ] },
-	{ "name" : "fixed", "constant" : false, "outputs": [ { "type": "bytes32" } ] },
-	{ "name" : "multi", "constant" : false, "outputs": [ { "type": "bytes" }, { "type": "bytes" } ] },
-	{ "name" : "intArraySingle", "constant" : false, "outputs": [ { "type": "uint256[3]" } ] },
-	{ "name" : "addressSliceSingle", "constant" : false, "outputs": [ { "type": "address[]" } ] },
-	{ "name" : "addressSliceDouble", "constant" : false, "outputs": [ { "name": "a", "type": "address[]" }, { "name": "b", "type": "address[]" } ] },
-	{ "name" : "mixedBytes", "constant" : true, "outputs": [ { "name": "a", "type": "bytes" }, { "name": "b", "type": "bytes32" } ] }]`
-
-	abi, err := JSON(strings.NewReader(definition))
+func TestUnpackIntoMapNamingConflict(t *testing.T) {
+	// Two methods have the same name
+	var abiJSON = `[{"constant":false,"inputs":[{"name":"memo","type":"bytes"}],"name":"get","outputs":[],"payable":true,"stateMutability":"payable","type":"function"},{"constant":false,"inputs":[],"name":"send","outputs":[{"name":"amount","type":"uint256"}],"payable":true,"stateMutability":"payable","type":"function"},{"constant":false,"inputs":[{"name":"addr","type":"address"}],"name":"get","outputs":[{"name":"hash","type":"bytes"}],"payable":true,"stateMutability":"payable","type":"function"}]`
+	abi, err := JSON(strings.NewReader(abiJSON))
 	if err != nil {
 		t.Fatal(err)
 	}
-	buff := new(bytes.Buffer)
-
-	// marshal int
-	var Int *big.Int
-	err = abi.Unpack(&Int, "int", common.Hex2Bytes("0000000000000000000000000000000000000000000000000000000000000001"))
+	var hexdata = `00000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000060000000000000000000000000000000000000000000000000000000000000000158`
+	data, err := hex.DecodeString(hexdata)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data)%32 == 0 {
+		t.Errorf("len(data) is %d, want a non-multiple of 32", len(data))
+	}
+	getMap := map[string]interface{}{}
+	if err = abi.UnpackIntoMap(getMap, "get", data); err == nil {
+		t.Error("naming conflict between two methods; error expected")
+	}
+
+	// Two events have the same name
+	abiJSON = `[{"constant":false,"inputs":[{"name":"memo","type":"bytes"}],"name":"receive","outputs":[],"payable":true,"stateMutability":"payable","type":"function"},{"anonymous":false,"inputs":[{"indexed":false,"name":"sender","type":"address"},{"indexed":false,"name":"amount","type":"uint256"},{"indexed":false,"name":"memo","type":"bytes"}],"name":"received","type":"event"},{"anonymous":false,"inputs":[{"indexed":false,"name":"sender","type":"address"}],"name":"received","type":"event"}]`
+	abi, err = JSON(strings.NewReader(abiJSON))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hexdata = `000000000000000000000000376c47978271565f56deb45495afa69e59c16ab200000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000060000000000000000000000000000000000000000000000000000000000000000158`
+	data, err = hex.DecodeString(hexdata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data)%32 == 0 {
+		t.Errorf("len(data) is %d, want a non-multiple of 32", len(data))
+	}
+	receivedMap := map[string]interface{}{}
+	if err = abi.UnpackIntoMap(receivedMap, "received", data); err != nil {
+		t.Error("naming conflict between two events; no error expected")
+	}
+
+	// Method and event have the same name
+	abiJSON = `[{"constant":false,"inputs":[{"name":"memo","type":"bytes"}],"name":"received","outputs":[],"payable":true,"stateMutability":"payable","type":"function"},{"anonymous":false,"inputs":[{"indexed":false,"name":"sender","type":"address"},{"indexed":false,"name":"amount","type":"uint256"},{"indexed":false,"name":"memo","type":"bytes"}],"name":"received","type":"event"},{"anonymous":false,"inputs":[{"indexed":false,"name":"sender","type":"address"}],"name":"receivedAddr","type":"event"}]`
+	abi, err = JSON(strings.NewReader(abiJSON))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data)%32 == 0 {
+		t.Errorf("len(data) is %d, want a non-multiple of 32", len(data))
+	}
+	if err = abi.UnpackIntoMap(receivedMap, "received", data); err == nil {
+		t.Error("naming conflict between an event and a method; error expected")
+	}
+
+	// Conflict is case sensitive
+	abiJSON = `[{"constant":false,"inputs":[{"name":"memo","type":"bytes"}],"name":"received","outputs":[],"payable":true,"stateMutability":"payable","type":"function"},{"anonymous":false,"inputs":[{"indexed":false,"name":"sender","type":"address"},{"indexed":false,"name":"amount","type":"uint256"},{"indexed":false,"name":"memo","type":"bytes"}],"name":"Received","type":"event"},{"anonymous":false,"inputs":[{"indexed":false,"name":"sender","type":"address"}],"name":"receivedAddr","type":"event"}]`
+	abi, err = JSON(strings.NewReader(abiJSON))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data)%32 == 0 {
+		t.Errorf("len(data) is %d, want a non-multiple of 32", len(data))
+	}
+	expectedReceivedMap := map[string]interface{}{
+		"sender": common.HexToAddress("0x376c47978271565f56DEB45495afa69E59c16Ab2"),
+		"amount": big.NewInt(1),
+		"memo":   []byte{88},
+	}
+	if err = abi.UnpackIntoMap(receivedMap, "Received", data); err != nil {
 		t.Error(err)
 	}
-
-	if Int == nil || Int.Cmp(big.NewInt(1)) != 0 {
-		t.Error("expected Int to be 1 got", Int)
+	if len(receivedMap) != 3 {
+		t.Error("unpacked `received` map expected to have length 3")
 	}
+	if receivedMap["sender"] != expectedReceivedMap["sender"] {
+		t.Error("unpacked `received` map does not match expected map")
+	}
+	if receivedMap["amount"].(*big.Int).Cmp(expectedReceivedMap["amount"].(*big.Int)) != 0 {
+		t.Error("unpacked `received` map does not match expected map")
+	}
+	if !bytes.Equal(receivedMap["memo"].([]byte), expectedReceivedMap["memo"].([]byte)) {
+		t.Error("unpacked `received` map does not match expected map")
+	}
+}
 
-	// marshal bool
-	var Bool bool
-	err = abi.Unpack(&Bool, "bool", common.Hex2Bytes("0000000000000000000000000000000000000000000000000000000000000001"))
+func TestABI_MethodById(t *testing.T) {
+	const abiJSON = `[
+		{"type":"function","name":"receive","constant":false,"inputs":[{"name":"memo","type":"bytes"}],"outputs":[],"payable":true,"stateMutability":"payable"},
+		{"type":"event","name":"received","anonymous":false,"inputs":[{"indexed":false,"name":"sender","type":"address"},{"indexed":false,"name":"amount","type":"uint256"},{"indexed":false,"name":"memo","type":"bytes"}]},
+		{"type":"function","name":"fixedArrStr","constant":true,"inputs":[{"name":"str","type":"string"},{"name":"fixedArr","type":"uint256[2]"}]},
+		{"type":"function","name":"fixedArrBytes","constant":true,"inputs":[{"name":"str","type":"bytes"},{"name":"fixedArr","type":"uint256[2]"}]},
+		{"type":"function","name":"mixedArrStr","constant":true,"inputs":[{"name":"str","type":"string"},{"name":"fixedArr","type":"uint256[2]"},{"name":"dynArr","type":"uint256[]"}]},
+		{"type":"function","name":"doubleFixedArrStr","constant":true,"inputs":[{"name":"str","type":"string"},{"name":"fixedArr1","type":"uint256[2]"},{"name":"fixedArr2","type":"uint256[3]"}]},
+		{"type":"function","name":"multipleMixedArrStr","constant":true,"inputs":[{"name":"str","type":"string"},{"name":"fixedArr1","type":"uint256[2]"},{"name":"dynArr","type":"uint256[]"},{"name":"fixedArr2","type":"uint256[3]"}]},
+		{"type":"function","name":"balance","constant":true},
+		{"type":"function","name":"send","constant":false,"inputs":[{"name":"amount","type":"uint256"}]},
+		{"type":"function","name":"test","constant":false,"inputs":[{"name":"number","type":"uint32"}]},
+		{"type":"function","name":"string","constant":false,"inputs":[{"name":"inputs","type":"string"}]},
+		{"type":"function","name":"bool","constant":false,"inputs":[{"name":"inputs","type":"bool"}]},
+		{"type":"function","name":"address","constant":false,"inputs":[{"name":"inputs","type":"address"}]},
+		{"type":"function","name":"uint64[2]","constant":false,"inputs":[{"name":"inputs","type":"uint64[2]"}]},
+		{"type":"function","name":"uint64[]","constant":false,"inputs":[{"name":"inputs","type":"uint64[]"}]},
+		{"type":"function","name":"foo","constant":false,"inputs":[{"name":"inputs","type":"uint32"}]},
+		{"type":"function","name":"bar","constant":false,"inputs":[{"name":"inputs","type":"uint32"},{"name":"string","type":"uint16"}]},
+		{"type":"function","name":"_slice","constant":false,"inputs":[{"name":"inputs","type":"uint32[2]"}]},
+		{"type":"function","name":"__slice256","constant":false,"inputs":[{"name":"inputs","type":"uint256[2]"}]},
+		{"type":"function","name":"sliceAddress","constant":false,"inputs":[{"name":"inputs","type":"address[]"}]},
+		{"type":"function","name":"sliceMultiAddress","constant":false,"inputs":[{"name":"a","type":"address[]"},{"name":"b","type":"address[]"}]}
+	]
+`
+	abi, err := JSON(strings.NewReader(abiJSON))
 	if err != nil {
-		t.Error(err)
+		t.Fatal(err)
 	}
-
-	if !Bool {
-		t.Error("expected Bool to be true")
-	}
-
-	// marshal dynamic bytes max length 32
-	buff.Write(common.Hex2Bytes("0000000000000000000000000000000000000000000000000000000000000020"))
-	buff.Write(common.Hex2Bytes("0000000000000000000000000000000000000000000000000000000000000020"))
-	bytesOut := common.RightPadBytes([]byte("hello"), 32)
-	buff.Write(bytesOut)
-
-	var Bytes []byte
-	err = abi.Unpack(&Bytes, "bytes", buff.Bytes())
-	if err != nil {
-		t.Error(err)
-	}
-
-	if !bytes.Equal(Bytes, bytesOut) {
-		t.Errorf("expected %x got %x", bytesOut, Bytes)
-	}
-
-	// marshall dynamic bytes max length 64
-	buff.Reset()
-	buff.Write(common.Hex2Bytes("0000000000000000000000000000000000000000000000000000000000000020"))
-	buff.Write(common.Hex2Bytes("0000000000000000000000000000000000000000000000000000000000000040"))
-	bytesOut = common.RightPadBytes([]byte("hello"), 64)
-	buff.Write(bytesOut)
-
-	err = abi.Unpack(&Bytes, "bytes", buff.Bytes())
-	if err != nil {
-		t.Error(err)
-	}
-
-	if !bytes.Equal(Bytes, bytesOut) {
-		t.Errorf("expected %x got %x", bytesOut, Bytes)
-	}
-
-	// marshall dynamic bytes max length 63
-	buff.Reset()
-	buff.Write(common.Hex2Bytes("0000000000000000000000000000000000000000000000000000000000000020"))
-	buff.Write(common.Hex2Bytes("000000000000000000000000000000000000000000000000000000000000003f"))
-	bytesOut = common.RightPadBytes([]byte("hello"), 63)
-	buff.Write(bytesOut)
-
-	err = abi.Unpack(&Bytes, "bytes", buff.Bytes())
-	if err != nil {
-		t.Error(err)
-	}
-
-	if !bytes.Equal(Bytes, bytesOut) {
-		t.Errorf("expected %x got %x", bytesOut, Bytes)
-	}
-
-	// marshal dynamic bytes output empty
-	err = abi.Unpack(&Bytes, "bytes", nil)
-	if err == nil {
-		t.Error("expected error")
-	}
-
-	// marshal dynamic bytes length 5
-	buff.Reset()
-	buff.Write(common.Hex2Bytes("0000000000000000000000000000000000000000000000000000000000000020"))
-	buff.Write(common.Hex2Bytes("0000000000000000000000000000000000000000000000000000000000000005"))
-	buff.Write(common.RightPadBytes([]byte("hello"), 32))
-
-	err = abi.Unpack(&Bytes, "bytes", buff.Bytes())
-	if err != nil {
-		t.Error(err)
-	}
-
-	if !bytes.Equal(Bytes, []byte("hello")) {
-		t.Errorf("expected %x got %x", bytesOut, Bytes)
-	}
-
-	// marshal dynamic bytes length 5
-	buff.Reset()
-	buff.Write(common.RightPadBytes([]byte("hello"), 32))
-
-	var hash common.Hash
-	err = abi.Unpack(&hash, "fixed", buff.Bytes())
-	if err != nil {
-		t.Error(err)
-	}
-
-	helloHash := common.BytesToHash(common.RightPadBytes([]byte("hello"), 32))
-	if hash != helloHash {
-		t.Errorf("Expected %x to equal %x", hash, helloHash)
-	}
-
-	// marshal error
-	buff.Reset()
-	buff.Write(common.Hex2Bytes("0000000000000000000000000000000000000000000000000000000000000020"))
-	err = abi.Unpack(&Bytes, "bytes", buff.Bytes())
-	if err == nil {
-		t.Error("expected error")
-	}
-
-	err = abi.Unpack(&Bytes, "multi", make([]byte, 64))
-	if err == nil {
-		t.Error("expected error")
-	}
-
-	// marshal mixed bytes
-	buff.Reset()
-	buff.Write(common.Hex2Bytes("0000000000000000000000000000000000000000000000000000000000000040"))
-	fixed := common.Hex2Bytes("0000000000000000000000000000000000000000000000000000000000000001")
-	buff.Write(fixed)
-	buff.Write(common.Hex2Bytes("0000000000000000000000000000000000000000000000000000000000000020"))
-	bytesOut = common.RightPadBytes([]byte("hello"), 32)
-	buff.Write(bytesOut)
-
-	var out []interface{}
-	err = abi.Unpack(&out, "mixedBytes", buff.Bytes())
-	if err != nil {
-		t.Fatal("didn't expect error:", err)
-	}
-
-	if !bytes.Equal(bytesOut, out[0].([]byte)) {
-		t.Errorf("expected %x, got %x", bytesOut, out[0])
-	}
-
-	if !bytes.Equal(fixed, out[1].([]byte)) {
-		t.Errorf("expected %x, got %x", fixed, out[1])
-	}
-
-	buff.Reset()
-	buff.Write(common.Hex2Bytes("0000000000000000000000000000000000000000000000000000000000000001"))
-	buff.Write(common.Hex2Bytes("0000000000000000000000000000000000000000000000000000000000000002"))
-	buff.Write(common.Hex2Bytes("0000000000000000000000000000000000000000000000000000000000000003"))
-	// marshal int array
-	var intArray [3]*big.Int
-	err = abi.Unpack(&intArray, "intArraySingle", buff.Bytes())
-	if err != nil {
-		t.Error(err)
-	}
-	var testAgainstIntArray [3]*big.Int
-	testAgainstIntArray[0] = big.NewInt(1)
-	testAgainstIntArray[1] = big.NewInt(2)
-	testAgainstIntArray[2] = big.NewInt(3)
-
-	for i, Int := range intArray {
-		if Int.Cmp(testAgainstIntArray[i]) != 0 {
-			t.Errorf("expected %v, got %v", testAgainstIntArray[i], Int)
+	for name, m := range abi.Methods {
+		a := fmt.Sprintf("%v", m)
+		m2, err := abi.MethodById(m.ID())
+		if err != nil {
+			t.Fatalf("Failed to look up ABI method: %v", err)
+		}
+		b := fmt.Sprintf("%v", m2)
+		if a != b {
+			t.Errorf("Method %v (id %v) not 'findable' by id in ABI", name, common.ToHex(m.ID()))
 		}
 	}
-	// marshal address slice
-	buff.Reset()
-	buff.Write(common.Hex2Bytes("0000000000000000000000000000000000000000000000000000000000000020")) // offset
-	buff.Write(common.Hex2Bytes("0000000000000000000000000000000000000000000000000000000000000001")) // size
-	buff.Write(common.Hex2Bytes("0000000000000000000000000100000000000000000000000000000000000000"))
+	// Also test empty
+	if _, err := abi.MethodById([]byte{0x00}); err == nil {
+		t.Errorf("Expected error, too short to decode data")
+	}
+	if _, err := abi.MethodById([]byte{}); err == nil {
+		t.Errorf("Expected error, too short to decode data")
+	}
+	if _, err := abi.MethodById(nil); err == nil {
+		t.Errorf("Expected error, nil is short to decode data")
+	}
+}
 
-	var outAddr []common.Address
-	err = abi.Unpack(&outAddr, "addressSliceSingle", buff.Bytes())
+func TestABI_EventById(t *testing.T) {
+	tests := []struct {
+		name  string
+		json  string
+		event string
+	}{
+		{
+			name: "",
+			json: `[
+			{"type":"event","name":"received","anonymous":false,"inputs":[
+				{"indexed":false,"name":"sender","type":"address"},
+				{"indexed":false,"name":"amount","type":"uint256"},
+				{"indexed":false,"name":"memo","type":"bytes"}
+				]
+			}]`,
+			event: "received(address,uint256,bytes)",
+		}, {
+			name: "",
+			json: `[
+				{ "constant": true, "inputs": [], "name": "name", "outputs": [ { "name": "", "type": "string" } ], "payable": false, "stateMutability": "view", "type": "function" },
+				{ "constant": false, "inputs": [ { "name": "_spender", "type": "address" }, { "name": "_value", "type": "uint256" } ], "name": "approve", "outputs": [ { "name": "", "type": "bool" } ], "payable": false, "stateMutability": "nonpayable", "type": "function" },
+				{ "constant": true, "inputs": [], "name": "totalSupply", "outputs": [ { "name": "", "type": "uint256" } ], "payable": false, "stateMutability": "view", "type": "function" },
+				{ "constant": false, "inputs": [ { "name": "_from", "type": "address" }, { "name": "_to", "type": "address" }, { "name": "_value", "type": "uint256" } ], "name": "transferFrom", "outputs": [ { "name": "", "type": "bool" } ], "payable": false, "stateMutability": "nonpayable", "type": "function" },
+				{ "constant": true, "inputs": [], "name": "decimals", "outputs": [ { "name": "", "type": "uint8" } ], "payable": false, "stateMutability": "view", "type": "function" },
+				{ "constant": true, "inputs": [ { "name": "_owner", "type": "address" } ], "name": "balanceOf", "outputs": [ { "name": "balance", "type": "uint256" } ], "payable": false, "stateMutability": "view", "type": "function" },
+				{ "constant": true, "inputs": [], "name": "symbol", "outputs": [ { "name": "", "type": "string" } ], "payable": false, "stateMutability": "view", "type": "function" },
+				{ "constant": false, "inputs": [ { "name": "_to", "type": "address" }, { "name": "_value", "type": "uint256" } ], "name": "transfer", "outputs": [ { "name": "", "type": "bool" } ], "payable": false, "stateMutability": "nonpayable", "type": "function" },
+				{ "constant": true, "inputs": [ { "name": "_owner", "type": "address" }, { "name": "_spender", "type": "address" } ], "name": "allowance", "outputs": [ { "name": "", "type": "uint256" } ], "payable": false, "stateMutability": "view", "type": "function" },
+				{ "payable": true, "stateMutability": "payable", "type": "fallback" },
+				{ "anonymous": false, "inputs": [ { "indexed": true, "name": "owner", "type": "address" }, { "indexed": true, "name": "spender", "type": "address" }, { "indexed": false, "name": "value", "type": "uint256" } ], "name": "Approval", "type": "event" },
+				{ "anonymous": false, "inputs": [ { "indexed": true, "name": "from", "type": "address" }, { "indexed": true, "name": "to", "type": "address" }, { "indexed": false, "name": "value", "type": "uint256" } ], "name": "Transfer", "type": "event" }
+			]`,
+			event: "Transfer(address,address,uint256)",
+		},
+	}
+
+	for testnum, test := range tests {
+		abi, err := JSON(strings.NewReader(test.json))
+		if err != nil {
+			t.Error(err)
+		}
+
+		topic := test.event
+		topicID := crypto.Keccak256Hash([]byte(topic))
+
+		event, err := abi.EventByID(topicID)
+		if err != nil {
+			t.Fatalf("Failed to look up ABI method: %v, test #%d", err, testnum)
+		}
+		if event == nil {
+			t.Errorf("We should find a event for topic %s, test #%d", topicID.Hex(), testnum)
+		}
+
+		if event.ID() != topicID {
+			t.Errorf("Event id %s does not match topic %s, test #%d", event.ID().Hex(), topicID.Hex(), testnum)
+		}
+
+		unknowntopicID := crypto.Keccak256Hash([]byte("unknownEvent"))
+		unknownEvent, err := abi.EventByID(unknowntopicID)
+		if err == nil {
+			t.Errorf("EventByID should return an error if a topic is not found, test #%d", testnum)
+		}
+		if unknownEvent != nil {
+			t.Errorf("We should not find any event for topic %s, test #%d", unknowntopicID.Hex(), testnum)
+		}
+	}
+}
+
+func TestDuplicateMethodNames(t *testing.T) {
+	abiJSON := `[{"constant":false,"inputs":[{"name":"to","type":"address"},{"name":"value","type":"uint256"}],"name":"transfer","outputs":[{"name":"ok","type":"bool"}],"payable":false,"stateMutability":"nonpayable","type":"function"},{"constant":false,"inputs":[{"name":"to","type":"address"},{"name":"value","type":"uint256"},{"name":"data","type":"bytes"}],"name":"transfer","outputs":[{"name":"ok","type":"bool"}],"payable":false,"stateMutability":"nonpayable","type":"function"},{"constant":false,"inputs":[{"name":"to","type":"address"},{"name":"value","type":"uint256"},{"name":"data","type":"bytes"},{"name":"customFallback","type":"string"}],"name":"transfer","outputs":[{"name":"ok","type":"bool"}],"payable":false,"stateMutability":"nonpayable","type":"function"}]`
+	contractAbi, err := JSON(strings.NewReader(abiJSON))
 	if err != nil {
-		t.Fatal("didn't expect error:", err)
+		t.Fatal(err)
 	}
-
-	if len(outAddr) != 1 {
-		t.Fatal("expected 1 item, got", len(outAddr))
+	if _, ok := contractAbi.Methods["transfer"]; !ok {
+		t.Fatalf("Could not find original method")
 	}
-
-	if outAddr[0] != (common.Address{1}) {
-		t.Errorf("expected %x, got %x", common.Address{1}, outAddr[0])
+	if _, ok := contractAbi.Methods["transfer0"]; !ok {
+		t.Fatalf("Could not find duplicate method")
 	}
-
-	// marshal multiple address slice
-	buff.Reset()
-	buff.Write(common.Hex2Bytes("0000000000000000000000000000000000000000000000000000000000000040")) // offset
-	buff.Write(common.Hex2Bytes("0000000000000000000000000000000000000000000000000000000000000080")) // offset
-	buff.Write(common.Hex2Bytes("0000000000000000000000000000000000000000000000000000000000000001")) // size
-	buff.Write(common.Hex2Bytes("0000000000000000000000000100000000000000000000000000000000000000"))
-	buff.Write(common.Hex2Bytes("0000000000000000000000000000000000000000000000000000000000000002")) // size
-	buff.Write(common.Hex2Bytes("0000000000000000000000000200000000000000000000000000000000000000"))
-	buff.Write(common.Hex2Bytes("0000000000000000000000000300000000000000000000000000000000000000"))
-
-	var outAddrStruct struct {
-		A []common.Address
-		B []common.Address
+	if _, ok := contractAbi.Methods["transfer1"]; !ok {
+		t.Fatalf("Could not find duplicate method")
 	}
-	err = abi.Unpack(&outAddrStruct, "addressSliceDouble", buff.Bytes())
+	if _, ok := contractAbi.Methods["transfer2"]; ok {
+		t.Fatalf("Should not have found extra method")
+	}
+}
+
+// TestDoubleDuplicateMethodNames checks that if transfer0 already exists, there won't be a name
+// conflict and that the second transfer method will be renamed transfer1.
+func TestDoubleDuplicateMethodNames(t *testing.T) {
+	abiJSON := `[{"constant":false,"inputs":[{"name":"to","type":"address"},{"name":"value","type":"uint256"}],"name":"transfer","outputs":[{"name":"ok","type":"bool"}],"payable":false,"stateMutability":"nonpayable","type":"function"},{"constant":false,"inputs":[{"name":"to","type":"address"},{"name":"value","type":"uint256"},{"name":"data","type":"bytes"}],"name":"transfer0","outputs":[{"name":"ok","type":"bool"}],"payable":false,"stateMutability":"nonpayable","type":"function"},{"constant":false,"inputs":[{"name":"to","type":"address"},{"name":"value","type":"uint256"},{"name":"data","type":"bytes"},{"name":"customFallback","type":"string"}],"name":"transfer","outputs":[{"name":"ok","type":"bool"}],"payable":false,"stateMutability":"nonpayable","type":"function"}]`
+	contractAbi, err := JSON(strings.NewReader(abiJSON))
 	if err != nil {
-		t.Fatal("didn't expect error:", err)
+		t.Fatal(err)
 	}
-
-	if len(outAddrStruct.A) != 1 {
-		t.Fatal("expected 1 item, got", len(outAddrStruct.A))
+	if _, ok := contractAbi.Methods["transfer"]; !ok {
+		t.Fatalf("Could not find original method")
 	}
-
-	if outAddrStruct.A[0] != (common.Address{1}) {
-		t.Errorf("expected %x, got %x", common.Address{1}, outAddrStruct.A[0])
+	if _, ok := contractAbi.Methods["transfer0"]; !ok {
+		t.Fatalf("Could not find duplicate method")
 	}
-
-	if len(outAddrStruct.B) != 2 {
-		t.Fatal("expected 1 item, got", len(outAddrStruct.B))
+	if _, ok := contractAbi.Methods["transfer1"]; !ok {
+		t.Fatalf("Could not find duplicate method")
 	}
-
-	if outAddrStruct.B[0] != (common.Address{2}) {
-		t.Errorf("expected %x, got %x", common.Address{2}, outAddrStruct.B[0])
-	}
-	if outAddrStruct.B[1] != (common.Address{3}) {
-		t.Errorf("expected %x, got %x", common.Address{3}, outAddrStruct.B[1])
-	}
-
-	// marshal invalid address slice
-	buff.Reset()
-	buff.Write(common.Hex2Bytes("0000000000000000000000000000000000000000000000000000000000000100"))
-
-	err = abi.Unpack(&outAddr, "addressSliceSingle", buff.Bytes())
-	if err == nil {
-		t.Fatal("expected error:", err)
+	if _, ok := contractAbi.Methods["transfer2"]; ok {
+		t.Fatalf("Should not have found extra method")
 	}
 }

@@ -8,18 +8,13 @@
 .PHONY: geth-darwin geth-darwin-386 geth-darwin-amd64
 .PHONY: geth-windows geth-windows-386 geth-windows-amd64
 
-GOBIN = build/bin
+GOBIN = $(shell pwd)/build/bin
 GO ?= latest
 
 geth:
 	build/env.sh go run build/ci.go install ./cmd/geth
 	@echo "Done building."
 	@echo "Run \"$(GOBIN)/geth\" to launch geth."
-
-evm:
-	build/env.sh go run build/ci.go install ./cmd/evm
-	@echo "Done building."
-	@echo "Run \"$(GOBIN)/evm\" to start the evm."
 
 all:
 	build/env.sh go run build/ci.go install
@@ -37,7 +32,11 @@ ios:
 test: all
 	build/env.sh go run build/ci.go test
 
+lint: ## Run linters.
+	build/env.sh go run build/ci.go lint
+
 clean:
+	./build/clean_go_build_cache.sh
 	rm -fr build/_workspace/pkg/ $(GOBIN)/*
 
 # The devtools target installs tools required for 'go generate'.
@@ -45,9 +44,13 @@ clean:
 
 devtools:
 	env GOBIN= go get -u golang.org/x/tools/cmd/stringer
-	env GOBIN= go get -u github.com/jteeuwen/go-bindata/go-bindata
+	env GOBIN= go get -u github.com/kevinburke/go-bindata/go-bindata
 	env GOBIN= go get -u github.com/fjl/gencodec
+	env GOBIN= go get -u github.com/golang/protobuf/protoc-gen-go
 	env GOBIN= go install ./cmd/abigen
+	@type "npm" 2> /dev/null || echo 'Please install node.js and npm'
+	@type "solc" 2> /dev/null || echo 'Please install solc'
+	@type "protoc" 2> /dev/null || echo 'Please install protoc'
 
 # Cross Compilation Targets (xgo)
 

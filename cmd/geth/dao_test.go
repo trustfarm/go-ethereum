@@ -24,8 +24,7 @@ import (
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/core"
-	"github.com/ethereum/go-ethereum/ethdb"
+	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/params"
 )
 
@@ -89,7 +88,7 @@ func TestDAOForkBlockNewChain(t *testing.T) {
 		expectVote  bool
 	}{
 		// Test DAO Default Mainnet
-		{"", params.MainNetDAOForkBlock, true},
+		{"", params.MainnetChainConfig.DAOForkBlock, true},
 		// test DAO Init Old Privnet
 		{daoOldGenesis, nil, false},
 		// test DAO Default No Fork Privnet
@@ -112,16 +111,16 @@ func testDAOForkBlockNewChain(t *testing.T, test int, genesis string, expectBloc
 		if err := ioutil.WriteFile(json, []byte(genesis), 0600); err != nil {
 			t.Fatalf("test %d: failed to write genesis file: %v", test, err)
 		}
-		runGeth(t, "--datadir", datadir, "init", json).cmd.Wait()
+		runGeth(t, "--datadir", datadir, "init", json).WaitExit()
 	} else {
 		// Force chain initialization
 		args := []string{"--port", "0", "--maxpeers", "0", "--nodiscover", "--nat", "none", "--ipcdisable", "--datadir", datadir}
 		geth := runGeth(t, append(args, []string{"--exec", "2+2", "console"}...)...)
-		geth.cmd.Wait()
+		geth.WaitExit()
 	}
 	// Retrieve the DAO config flag from the database
 	path := filepath.Join(datadir, "geth", "chaindata")
-	db, err := ethdb.NewLDBDatabase(path, 0, 0)
+	db, err := rawdb.NewLevelDBDatabase(path, 0, 0, "")
 	if err != nil {
 		t.Fatalf("test %d: failed to open test database: %v", test, err)
 	}
@@ -131,8 +130,8 @@ func testDAOForkBlockNewChain(t *testing.T, test int, genesis string, expectBloc
 	if genesis != "" {
 		genesisHash = daoGenesisHash
 	}
-	config, err := core.GetChainConfig(db, genesisHash)
-	if err != nil {
+	config := rawdb.ReadChainConfig(db, genesisHash)
+	if config == nil {
 		t.Errorf("test %d: failed to retrieve chain config: %v", test, err)
 		return // we want to return here, the other checks can't make it past this point (nil panic).
 	}

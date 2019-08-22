@@ -18,73 +18,77 @@ package les
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/binary"
-	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common/mclock"
+	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/light"
 	"github.com/ethereum/go-ethereum/log"
 )
 
-var (
-	softRequestTimeout = time.Millisecond * 500
-	hardRequestTimeout = time.Second * 10
-)
-
-// peerDropFn is a callback type for dropping a peer detected as malicious.
-type peerDropFn func(id string)
-
-type odrPeerSelector interface {
-	adjustResponseTime(*poolEntry, time.Duration, bool)
-}
-
+// LesOdr implements light.OdrBackend
 type LesOdr struct {
-	light.OdrBackend
-	db           ethdb.Database
-	stop         chan struct{}
-	removePeer   peerDropFn
-	mlock, clock sync.Mutex
-	sentReqs     map[uint64]*sentReq
-	serverPool   odrPeerSelector
-	reqDist      *requestDistributor
+	db                                         ethdb.Database
+	indexerConfig                              *light.IndexerConfig
+	chtIndexer, bloomTrieIndexer, bloomIndexer *core.ChainIndexer
+	retriever                                  *retrieveManager
+	stop                                       chan struct{}
 }
 
-func NewLesOdr(db ethdb.Database) *LesOdr {
+func NewLesOdr(db ethdb.Database, config *light.IndexerConfig, retriever *retrieveManager) *LesOdr {
 	return &LesOdr{
-		db:       db,
-		stop:     make(chan struct{}),
-		sentReqs: make(map[uint64]*sentReq),
+		db:            db,
+		indexerConfig: config,
+		retriever:     retriever,
+		stop:          make(chan struct{}),
 	}
 }
 
+// Stop cancels all pending retrievals
 func (odr *LesOdr) Stop() {
 	close(odr.stop)
 }
 
+// Database returns the backing database
 func (odr *LesOdr) Database() ethdb.Database {
 	return odr.db
 }
 
-// validatorFunc is a function that processes a message.
-type validatorFunc func(ethdb.Database, *Msg) error
+// SetIndexers adds the necessary chain indexers to the ODR backend
+func (odr *LesOdr) SetIndexers(chtIndexer, bloomTrieIndexer, bloomIndexer *core.ChainIndexer) {
+	odr.chtIndexer = chtIndexer
+	odr.bloomTrieIndexer = bloomTrieIndexer
+	odr.bloomIndexer = bloomIndexer
+}
 
-// sentReq is a request waiting for an answer that satisfies its valFunc
-type sentReq struct {
-	valFunc  validatorFunc
-	sentTo   map[*peer]chan struct{}
-	lock     sync.RWMutex  // protects acces to sentTo
-	answered chan struct{} // closed and set to nil when any peer answers it
+// ChtIndexer returns the CHT chain indexer
+func (odr *LesOdr) ChtIndexer() *core.ChainIndexer {
+	return odr.chtIndexer
+}
+
+// BloomTrieIndexer returns the bloom trie chain indexer
+func (odr *LesOdr) BloomTrieIndexer() *core.ChainIndexer {
+	return odr.bloomTrieIndexer
+}
+
+// BloomIndexer returns the bloombits chain indexer
+func (odr *LesOdr) BloomIndexer() *core.ChainIndexer {
+	return odr.bloomIndexer
+}
+
+// IndexerConfig returns the indexer config.
+func (odr *LesOdr) IndexerConfig() *light.IndexerConfig {
+	return odr.indexerConfig
 }
 
 const (
 	MsgBlockBodies = iota
 	MsgCode
 	MsgReceipts
-	MsgProofs
-	MsgHeaderProofs
+	MsgProofsV2
+	MsgHelperTrieProofs
+	MsgTxStatus
 )
 
 // Msg encodes a LES message that delivers reply data for a request
@@ -94,166 +98,37 @@ type Msg struct {
 	Obj     interface{}
 }
 
-// Deliver is called by the LES protocol manager to deliver ODR reply messages to waiting requests
-func (self *LesOdr) Deliver(peer *peer, msg *Msg) error {
-	var delivered chan struct{}
-	self.mlock.Lock()
-	req, ok := self.sentReqs[msg.ReqID]
-	self.mlock.Unlock()
-	if ok {
-		req.lock.Lock()
-		delivered, ok = req.sentTo[peer]
-		req.lock.Unlock()
-	}
+// Retrieve tries to fetch an object from the LES network.
+// If the network retrieval was successful, it stores the object in local db.
+func (odr *LesOdr) Retrieve(ctx context.Context, req light.OdrRequest) (err error) {
+	lreq := LesRequest(req)
 
-	if !ok {
-		return errResp(ErrUnexpectedResponse, "reqID = %v", msg.ReqID)
-	}
-
-	if err := req.valFunc(self.db, msg); err != nil {
-		peer.Log().Warn("Invalid odr response", "err", err)
-		return errResp(ErrInvalidResponse, "reqID = %v", msg.ReqID)
-	}
-	close(delivered)
-	req.lock.Lock()
-	delete(req.sentTo, peer)
-	if req.answered != nil {
-		close(req.answered)
-		req.answered = nil
-	}
-	req.lock.Unlock()
-	return nil
-}
-
-func (self *LesOdr) requestPeer(req *sentReq, peer *peer, delivered, timeout chan struct{}, reqWg *sync.WaitGroup) {
-	stime := mclock.Now()
-	defer func() {
-		req.lock.Lock()
-		delete(req.sentTo, peer)
-		req.lock.Unlock()
-		reqWg.Done()
-	}()
-
-	select {
-	case <-delivered:
-		if self.serverPool != nil {
-			self.serverPool.adjustResponseTime(peer.poolEntry, time.Duration(mclock.Now()-stime), false)
-		}
-		return
-	case <-time.After(softRequestTimeout):
-		close(timeout)
-	case <-self.stop:
-		return
-	}
-
-	select {
-	case <-delivered:
-	case <-time.After(hardRequestTimeout):
-		peer.Log().Debug("Request timed out hard")
-		go self.removePeer(peer.id)
-	case <-self.stop:
-		return
-	}
-	if self.serverPool != nil {
-		self.serverPool.adjustResponseTime(peer.poolEntry, time.Duration(mclock.Now()-stime), true)
-	}
-}
-
-// networkRequest sends a request to known peers until an answer is received
-// or the context is cancelled
-func (self *LesOdr) networkRequest(ctx context.Context, lreq LesOdrRequest) error {
-	answered := make(chan struct{})
-	req := &sentReq{
-		valFunc:  lreq.Validate,
-		sentTo:   make(map[*peer]chan struct{}),
-		answered: answered, // reply delivered by any peer
-	}
-
-	exclude := make(map[*peer]struct{})
-
-	reqWg := new(sync.WaitGroup)
-	reqWg.Add(1)
-	defer reqWg.Done()
-
-	var timeout chan struct{}
-	reqID := getNextReqID()
+	reqID := genReqID()
 	rq := &distReq{
 		getCost: func(dp distPeer) uint64 {
 			return lreq.GetCost(dp.(*peer))
 		},
 		canSend: func(dp distPeer) bool {
 			p := dp.(*peer)
-			_, ok := exclude[p]
-			return !ok && lreq.CanSend(p)
+			if !p.onlyAnnounce {
+				return lreq.CanSend(p)
+			}
+			return false
 		},
 		request: func(dp distPeer) func() {
 			p := dp.(*peer)
-			exclude[p] = struct{}{}
-			delivered := make(chan struct{})
-			timeout = make(chan struct{})
-			req.lock.Lock()
-			req.sentTo[p] = delivered
-			req.lock.Unlock()
-			reqWg.Add(1)
 			cost := lreq.GetCost(p)
-			p.fcServer.QueueRequest(reqID, cost)
-			go self.requestPeer(req, p, delivered, timeout, reqWg)
+			p.fcServer.QueuedRequest(reqID, cost)
 			return func() { lreq.Request(reqID, p) }
 		},
 	}
-
-	self.mlock.Lock()
-	self.sentReqs[reqID] = req
-	self.mlock.Unlock()
-
-	go func() {
-		reqWg.Wait()
-		self.mlock.Lock()
-		delete(self.sentReqs, reqID)
-		self.mlock.Unlock()
-	}()
-
-	for {
-		peerChn := self.reqDist.queue(rq)
-		select {
-		case <-ctx.Done():
-			self.reqDist.cancel(rq)
-			return ctx.Err()
-		case <-answered:
-			self.reqDist.cancel(rq)
-			return nil
-		case _, ok := <-peerChn:
-			if !ok {
-				return ErrNoPeers
-			}
-		}
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-answered:
-			return nil
-		case <-timeout:
-		}
-	}
-}
-
-// Retrieve tries to fetch an object from the LES network.
-// If the network retrieval was successful, it stores the object in local db.
-func (self *LesOdr) Retrieve(ctx context.Context, req light.OdrRequest) (err error) {
-	lreq := LesRequest(req)
-	err = self.networkRequest(ctx, lreq)
-	if err == nil {
+	sent := mclock.Now()
+	if err = odr.retriever.retrieve(ctx, reqID, rq, func(p distPeer, msg *Msg) error { return lreq.Validate(odr.db, msg) }, odr.stop); err == nil {
 		// retrieved from network, store in db
-		req.StoreResult(self.db)
+		req.StoreResult(odr.db)
+		requestRTT.Update(time.Duration(mclock.Now() - sent))
 	} else {
 		log.Debug("Failed to retrieve data from network", "err", err)
 	}
 	return
-}
-
-func getNextReqID() uint64 {
-	var rnd [8]byte
-	rand.Read(rnd[:])
-	return binary.BigEndian.Uint64(rnd[:])
 }
